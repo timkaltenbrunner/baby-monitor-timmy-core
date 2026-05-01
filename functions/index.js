@@ -4,6 +4,19 @@ const { defineSecret, defineString } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const crypto = require("crypto");
+const {
+  CLOUDFLARE_TURN_BUILTIN_ID,
+  LOCAL_TURN_BUILTIN_ID,
+  DEFAULT_LOCAL_TURN_TIMEOUT_MS,
+  DEFAULT_LOCAL_TURN_TTL_SECONDS,
+  checkRateLimit,
+  isDebugPurchaseToken: isDebugPurchaseTokenGuard,
+  normalizeStringArray,
+  parsePositiveInt,
+  pickTestRunId: pickTestRunIdGuard,
+  renumberProviders,
+  sanitizeTurnProvider,
+} = require("./lib/public_helpers");
 
 initializeApp();
 
@@ -17,10 +30,6 @@ const localTurnPublicUrls = defineString("LOCAL_TURN_PUBLIC_URLS");
 const localTurnApiKey = defineSecret("LOCAL_TURN_API_KEY");
 const localTurnHmacSecret = defineSecret("LOCAL_TURN_HMAC_SECRET");
 
-const CLOUDFLARE_TURN_BUILTIN_ID = "cloudflare-builtin";
-const LOCAL_TURN_BUILTIN_ID = "local-turn-builtin";
-const DEFAULT_LOCAL_TURN_TIMEOUT_MS = 1500;
-const DEFAULT_LOCAL_TURN_TTL_SECONDS = 3600;
 const DEFAULT_CLIENT_CACHE_TTL_SECONDS = 3600;
 const DUAL_PROVIDER_CLIENT_CACHE_TTL_SECONDS = 300;
 
@@ -32,15 +41,9 @@ const DUAL_PROVIDER_CLIENT_CACHE_TTL_SECONDS = 300;
 // flows without a live Play account. Production must keep this flag unset.
 const GIFT_DEBUG_TOKENS_ALLOWED =
   process.env.GIFT_DEBUG_TOKENS_ALLOWED === "true";
-const DEBUG_TOKEN_PREFIX = "debug-e2e-";
-const TEST_RUN_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
 
 function isDebugPurchaseToken(tok) {
-  return (
-    GIFT_DEBUG_TOKENS_ALLOWED &&
-    typeof tok === "string" &&
-    tok.startsWith(DEBUG_TOKEN_PREFIX)
-  );
+  return isDebugPurchaseTokenGuard(tok, GIFT_DEBUG_TOKENS_ALLOWED);
 }
 
 /**
@@ -51,12 +54,11 @@ function isDebugPurchaseToken(tok) {
  * Returns null otherwise (production callers always get null).
  */
 function pickTestRunId(request, purchaseToken) {
-  if (!GIFT_DEBUG_TOKENS_ALLOWED) return null;
-  if (!isDebugPurchaseToken(purchaseToken)) return null;
-  const id = request && request.data && request.data.testRunId;
-  if (typeof id !== "string") return null;
-  if (!TEST_RUN_ID_REGEX.test(id)) return null;
-  return id;
+  return pickTestRunIdGuard(
+    request,
+    purchaseToken,
+    GIFT_DEBUG_TOKENS_ALLOWED
+  );
 }
 
 // ─── App Check (admin bypasses) ──────────────────────────────────────────────
@@ -81,27 +83,9 @@ function requireAdmin(request) {
 
 const rateLimitMap = new Map();
 const RATE_LIMIT_MAX = 10;
-const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 
 const configRateLimitMap = new Map();
 const CONFIG_RATE_LIMIT_MAX = 60;
-
-function checkRateLimit(map, uid, max) {
-  const now = Date.now();
-  const entry = map.get(uid);
-
-  if (!entry || now >= entry.resetAt) {
-    map.set(uid, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
-    return true;
-  }
-
-  if (entry.count >= max) {
-    return false;
-  }
-
-  entry.count++;
-  return true;
-}
 
 // ─── In-memory config cache ──────────────────────────────────────────────────
 
@@ -116,32 +100,6 @@ function safeParamValue(param) {
   } catch (error) {
     return "";
   }
-}
-
-function normalizeStringArray(rawValue) {
-  if (Array.isArray(rawValue)) {
-    return rawValue
-      .map((value) => String(value || "").trim())
-      .filter(Boolean);
-  }
-  const value = String(rawValue || "").trim();
-  if (!value) return [];
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-function parsePositiveInt(rawValue, fallback) {
-  const parsed = Number.parseInt(String(rawValue ?? ""), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function renumberProviders(providers) {
-  return providers.map((provider, index) => ({
-    ...provider,
-    priority: index + 1,
-  }));
 }
 
 function buildCloudflareBuiltinProvider(priority = 2) {
@@ -191,89 +149,6 @@ function mergeProviderWithDefaults(provider, defaults) {
       ...(provider.config || {}),
     },
   };
-}
-
-function sanitizeTurnProvider(provider) {
-  if (!provider || typeof provider !== "object") {
-    return null;
-  }
-
-  const id = String(provider.id || "").trim();
-  const type = String(provider.type || "").trim();
-  const name = String(provider.name || "").trim();
-  const enabled = provider.enabled !== false;
-  const priority = parsePositiveInt(provider.priority, 99);
-
-  if (id === CLOUDFLARE_TURN_BUILTIN_ID || type === "cloudflare") {
-    return {
-      id: CLOUDFLARE_TURN_BUILTIN_ID,
-      name: name || "Cloudflare TURN",
-      type: "cloudflare",
-      enabled,
-      priority,
-      builtin: true,
-      config: {
-        ttl: parsePositiveInt(provider.config?.ttl, 86400),
-      },
-    };
-  }
-
-  if (id === LOCAL_TURN_BUILTIN_ID || type === "local-rest") {
-    return {
-      id: LOCAL_TURN_BUILTIN_ID,
-      name: name || "Lokaler TURN",
-      type: "local-rest",
-      enabled,
-      priority,
-      builtin: true,
-      config: {
-        urls: normalizeStringArray(provider.config?.urls),
-        ttl: parsePositiveInt(
-          provider.config?.ttl,
-          DEFAULT_LOCAL_TURN_TTL_SECONDS
-        ),
-        timeoutMs: parsePositiveInt(
-          provider.config?.timeoutMs,
-          DEFAULT_LOCAL_TURN_TIMEOUT_MS
-        ),
-      },
-    };
-  }
-
-  if (type === "hmac-secret") {
-    return {
-      id: id || `turn-hmac-${Date.now()}`,
-      name: name || "TURN (HMAC)",
-      type: "hmac-secret",
-      enabled,
-      priority,
-      builtin: false,
-      config: {
-        urls: normalizeStringArray(provider.config?.urls),
-        secret: String(provider.config?.secret || "").trim(),
-        ttl: parsePositiveInt(provider.config?.ttl, 86400),
-        realm: String(provider.config?.realm || "").trim(),
-      },
-    };
-  }
-
-  if (type === "static") {
-    return {
-      id: id || `turn-${Date.now()}`,
-      name: name || "Custom TURN",
-      type: "static",
-      enabled,
-      priority,
-      builtin: false,
-      config: {
-        urls: normalizeStringArray(provider.config?.urls),
-        username: String(provider.config?.username || "").trim(),
-        credential: String(provider.config?.credential || "").trim(),
-      },
-    };
-  }
-
-  return null;
 }
 
 function buildProviderList(storedProviders = []) {

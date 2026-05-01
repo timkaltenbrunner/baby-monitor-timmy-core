@@ -1,64 +1,46 @@
 # baby_monitor_timmy_core
 
-Core security, pairing, and signaling primitives for Baby Monitor Timmy.
+Core pairing, cryptography, and signaling primitives for **Baby Monitor Timmy**.
 
-This package now lives inside the separate repository
-**`baby-monitor-timmy-core`**.
+This package is consumed via Git from the
+[`baby-monitor-timmy-core`](https://github.com/timkaltenbrunner/baby-monitor-timmy-core)
+repository. It is intentionally focused on logic that benefits from independent
+security review.
 
-## Purpose
+## Included APIs
 
-The goal is to separate the security-critical logic from the rest of the app so
-it can later live in its own repository with clear boundaries.
+- `CryptoService`
+- `EcdhService`
+- `PairData`
+- `PairingContract`
+- `PairingMeetingRepository`
+- `SignalingContract`
 
-Current extraction focus:
+## What this package covers
 
-- pairing cryptography
-- signaling contracts
-- pair-data model
-- Firestore meeting-point repository for pairing
+- short-code normalization and meeting-key derivation
+- pairing-key derivation from ECDH
+- AES-256-GCM encryption for signaling payloads
+- Firestore collection and field contracts
+- pairing meeting-point storage helpers
 
-## Repository scope
+## What stays outside this package
 
-`baby-monitor-timmy-core` contains:
+- app UI and flow orchestration
+- the full Firestore signaling adapter
+- release and store tooling
+- non-security product logic
 
-1. Dart packages for pairing, signaling, and shared security primitives
-2. Firebase backend code (`functions/`)
-3. Firestore rules
-4. Security and protocol documentation
-5. Client/server contract documentation
+## Local verification
 
-## Sync model
+```bash
+flutter pub get
+flutter analyze
+flutter test
+```
 
-The target maintenance model is:
+For the repository-wide contract and architecture docs, see:
 
-1. reusable Dart security code lives here
-2. the app consumes that code as a dependency
-3. backend artifacts such as `functions/`, `firestore.rules`, and selected docs
-   are curated here while the remaining split is completed
-
-This avoids long-term drift between a private product repo and a separately
-reviewable security core.
-
-## Current package boundaries
-
-### Included here
-
-- `src/pairing/crypto_service.dart`
-- `src/pairing/ecdh_service.dart`
-- `src/pairing/pairing_contract.dart`
-- `src/pairing/pairing_meeting_repository.dart`
-- `src/pairing/pairing_model.dart`
-- `src/signaling/signaling_contract.dart`
-
-### Still in the app repo
-
-- UI and screen flow
-- app orchestration
-- full Firestore signaling adapter
-- release/distribution tooling
-
-## Why this package exists
-
-Previously, the pairing flow mixed UI, Firestore access, and cryptographic
-logic too closely. This package is part of the refactor that makes those
-boundaries explicit inside the dedicated core repository.
+- `../../docs/architecture.md`
+- `../../docs/security-contract.md`
+- `../../docs/SECURITY.md`

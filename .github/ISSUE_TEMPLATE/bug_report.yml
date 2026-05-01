@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible bug in the public security core.
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report an issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is broken and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include code, commands, or configuration where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Flutter/Node/Firebase emulator versions and any other relevant setup details.

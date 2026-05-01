@@ -1,12 +1,13 @@
 # Security Contract Overview
 
-This document describes the security-relevant backend and protocol surface of
+This document describes the public, security-relevant contract exposed by
 **`baby-monitor-timmy-core`**.
 
-The repository is currently private. Its purpose is to keep the contract
-explicit while the split from the product repository is completed.
+It covers the Firestore collections, callable Cloud Functions, and extracted
+client-side primitives that together make up the security-critical protocol
+surface of Baby Monitor Timmy.
 
-## 1. Firestore collections used as protocol surface
+## Firestore collections used as protocol surface
 
 ### `pairing_codes/{meetingKey}`
 
@@ -14,7 +15,7 @@ Purpose:
 
 - short-lived ECDH meeting point
 - stores public keys only
-- no pairing key is ever written to Firestore
+- never stores the pairing key itself
 
 Typical fields:
 
@@ -43,7 +44,7 @@ Typical fields:
 
 Purpose:
 
-- temporary signaling document for one connection attempt
+- temporary signaling document for a single connection attempt
 
 Typical fields:
 
@@ -76,10 +77,10 @@ Typical fields:
 - `campaign_codes/{slug}`
 - `campaign_redemptions/{id}`
 
-These belong to the same overall client/server contract, but are not yet part
-of the extracted Dart package surface.
+These collections are part of the public backend contract even though they are
+not represented by a dedicated Dart API in the extracted package.
 
-## 2. Callable Cloud Functions used by the app
+## Callable Cloud Functions used by the app
 
 ### `getTurnCredentials`
 
@@ -95,19 +96,19 @@ Creates a new gift code for an active subscriber.
 
 ### `redeemGiftCode`
 
-Redeems a gift code for an active subscription purchase.
+Redeems a gift code for an eligible subscription purchase.
 
 ### `checkGiftCodeStatus`
 
-Polls the backend for redemption status of outstanding codes.
+Polls the backend for the redemption status of outstanding codes.
 
 ### `redeemCampaignCode`
 
 Applies a campaign-based billing defer for an eligible purchase.
 
-## 3. Security-critical client primitives already extracted
+## Extracted client-side security primitives
 
-### Pairing / crypto
+### Pairing and crypto
 
 - short-code generation
 - meeting-key derivation
@@ -121,10 +122,14 @@ Applies a campaign-based billing defer for an eligible purchase.
 
 - Firestore collection names
 - Firestore field names
-- session/candidate status constants
+- session and candidate status constants
 
-## 4. Next extraction steps
+## Repository boundary
 
-1. split the full Firestore signaling adapter more cleanly from app orchestration
-2. move additional protocol-facing client code into this repository
-3. keep the app repo focused on UI, product flow, and non-core logic
+This repository intentionally does **not** contain:
+
+- app UI and navigation
+- product orchestration outside the security-relevant flow
+- store and release management tooling
+
+See [`public-scope.md`](public-scope.md) for a more detailed boundary description.

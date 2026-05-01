@@ -1,6 +1,10 @@
 name: baby_monitor_timmy_core
 description: Core security, pairing, and signaling primitives for Baby Monitor Timmy
+version: 0.1.0
 publish_to: 'none'
+homepage: https://github.com/timkaltenbrunner/baby-monitor-timmy-core
+repository: https://github.com/timkaltenbrunner/baby-monitor-timmy-core
+issue_tracker: https://github.com/timkaltenbrunner/baby-monitor-timmy-core/issues
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -13,3 +17,7 @@ dependencies:
   encrypt: ^5.0.3
   pointycastle: ^3.9.1
   uuid: ^4.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
