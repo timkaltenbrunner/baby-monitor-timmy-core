@@ -1,7 +1,5 @@
 # baby-monitor-timmy-core
 
-![Baby Monitor Timmy](assets/timmy-logo.png)
-
 Security-relevant backend, protocol, and pairing primitives for **Baby Monitor Timmy**.
 
 This repository is the public home of the parts that matter most for security review:
