@@ -1,0 +1,15 @@
+name: baby_monitor_timmy_core
+description: Core security, pairing, and signaling primitives for Baby Monitor Timmy
+publish_to: 'none'
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cloud_firestore: ^5.4.0
+  crypto: ^3.0.6
+  encrypt: ^5.0.3
+  pointycastle: ^3.9.1
+  uuid: ^4.4.0

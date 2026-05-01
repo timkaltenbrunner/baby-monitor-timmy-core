@@ -1,0 +1,14 @@
+.dart_tool/
+.firebase/
+.flutter-plugins
+.flutter-plugins-dependencies
+.idea/
+.vscode/
+build/
+coverage/
+functions/node_modules/
+packages/**/.dart_tool/
+packages/**/build/
+*.log
+.env
+.env.*

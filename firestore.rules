@@ -1,0 +1,127 @@
+rules_version = '2';
+// Baby Monitor Timmy – Firestore Security Rules
+//
+// Access model: Any authenticated user can read/write any document.
+// This is BY DESIGN — the document path (SHA-256 hash of pairing key)
+// IS the secret. Both devices compute the same hash independently.
+// Data validation rules below prevent malformed or oversized writes.
+//
+// Admin collection: mostly readable by authenticated users, write only by admin UID.
+// Exception: /admin/turn_config is admin-only because it can contain TURN secrets.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Admin UID for write access to admin collection
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.uid == 'DcyIopcaDjUCcHbUhx0VHYM8hZ33';
+    }
+
+    // TURN config can contain provider credentials and API keys.
+    // Keep it admin-only; app clients receive only short-lived credentials
+    // through Cloud Functions.
+    match /admin/turn_config {
+      allow read, write: if isAdmin();
+    }
+
+    // Other admin config remains readable by authenticated clients and
+    // writable only by admin.
+    match /admin/{document=**} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    // Sessions: ephemeral WebRTC signaling documents
+    match /sessions/{sessionId} {
+      allow read, delete: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['status', 'createdAt'])
+        && request.resource.data.keys().hasOnly(
+             ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
+              'createdAt', 'updatedAt', 'version',
+              'babyPremium', 'parentPremium',
+              'babyTurnProvider', 'babyTurnProviders',
+              'parentTurnProvider', 'parentTurnProviders',
+              'babyActiveTurnUrl', 'babyActiveTurnProtocol', 'babyActiveTurnProvider',
+              'parentActiveTurnUrl', 'parentActiveTurnProtocol', 'parentActiveTurnProvider'])
+        && request.resource.data.status is string;
+      allow update: if request.auth != null
+        && request.resource.data.keys().hasOnly(
+             ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
+              'createdAt', 'updatedAt', 'version',
+              'babyPremium', 'parentPremium',
+              'babyTurnProvider', 'babyTurnProviders',
+              'parentTurnProvider', 'parentTurnProviders',
+              'babyActiveTurnUrl', 'babyActiveTurnProtocol', 'babyActiveTurnProvider',
+              'parentActiveTurnUrl', 'parentActiveTurnProtocol', 'parentActiveTurnProvider'])
+        && request.resource.data.status is string;
+    }
+
+    // ICE candidates from baby device
+    match /sessions/{sessionId}/candidates_baby/{id} {
+      allow read, delete: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['candidate', 'ts'])
+        && request.resource.data.keys().hasOnly(
+             ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
+        && request.resource.data.candidate is string;
+    }
+
+    // ICE candidates from parent device
+    match /sessions/{sessionId}/candidates_parent/{id} {
+      allow read, delete: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['candidate', 'ts'])
+        && request.resource.data.keys().hasOnly(
+             ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
+        && request.resource.data.candidate is string;
+    }
+
+    // Pairing codes: ECDH key exchange meeting points
+    match /pairing_codes/{code} {
+      allow read, delete: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasOnly(
+             ['createdAt', 'pubkeys', 'status']);
+      allow update: if request.auth != null
+        && request.resource.data.keys().hasOnly(
+             ['createdAt', 'pubkeys', 'status']);
+    }
+
+    // Pairings: persistent pairing state for mode selection
+    match /pairings/{pairingId} {
+      allow read, delete: if request.auth != null;
+      allow create: if request.auth != null
+         && request.resource.data.keys().hasAll(['status', 'createdAt'])
+         && request.resource.data.keys().hasOnly(
+             ['status', 'createdAt', 'updatedAt', 'activeSessionId',
+               'selectedMode', 'selectedBy', 'subscriptionMembers'])
+         && request.resource.data.status is string;
+      allow update: if request.auth != null
+         && request.resource.data.keys().hasOnly(
+             ['status', 'createdAt', 'updatedAt', 'activeSessionId',
+               'selectedMode', 'selectedBy', 'subscriptionMembers']);
+    }
+
+    // Gift codes (user-to-user). Authenticated clients may read (sharer
+    // polls status of own codes; recipient validates code before redeem).
+    // Only the Cloud Functions Admin SDK writes.
+    match /gift_codes/{nonce} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // Campaign codes (one-to-many ad campaigns). Clients read to validate
+    // a slug before submitting. Admin curates docs directly.
+    match /campaign_codes/{slug} {
+      allow read: if request.auth != null;
+      allow write: if isAdmin();
+    }
+
+    // Campaign redemptions (idempotency ledger). Server-only.
+    match /campaign_redemptions/{id} {
+      allow read: if false;
+      allow write: if false;
+    }
+  }
+}
