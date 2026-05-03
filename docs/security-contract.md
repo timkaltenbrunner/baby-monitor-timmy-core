@@ -3,62 +3,61 @@
 This document describes the public, security-relevant contract exposed by
 **`baby-monitor-timmy-core`**.
 
-It covers the Firestore collections, callable Cloud Functions, and extracted
-client-side primitives that together make up the security-critical protocol
-surface of Baby Monitor Timmy.
-
 ## Firestore collections used as protocol surface
 
 ### `pairing_codes/{meetingKey}`
 
-Purpose:
-
-- short-lived ECDH meeting point
-- stores public keys only
-- never stores the pairing key itself
+Short-lived ECDH meeting point. It stores public keys only and never stores the
+pairing key.
 
 Typical fields:
 
 - `createdAt`
 - `status`
 - `pubkeys`
-- optional Web Companion metadata: `peerType`, `webUid`, `webSessionId`, `webNonce`
+- optional Web Companion metadata: `peerType`, `webUid`, `webSessionId`
 
-The meeting point is still an unauthorised ECDH rendezvous. Public-key
-replacement is detected by mandatory SAS verification; the server does not treat
-the 4-character code as a security secret.
+The 4-character code is a rendezvous hint, not a security secret. Public-key
+replacement is detected by mandatory SAS verification.
 
-### `pair_access/{pairingDocKey}_{uid}`
+### `web_client_sessions/{webUid}`
 
-Purpose:
-
-- backend-issued, short-lived Firestore access capability
-- binds a Firebase Auth UID to one `pairingDocKey`
-- differentiates mobile access from Web Companion browser access
+Server-written active Web Companion lease. A browser can use normal encrypted
+signaling only while this document is active and matches its Firebase Auth custom
+claim.
 
 Typical fields:
 
-- `pairingDocKey`
-- `uid`
-- `role` (`mobile` or `web`)
-- `allowedRole` (`baby`, `parent`, or `any`)
-- `webSessionId`
-- `webNonce`
+- `status` (`active`, `revoked`, or `expired`)
 - `mobileUid`
-- `createdAt`
+- `webUid`
+- `webSessionId`
+- `pairingDocKey`
+- `premiumSource`
+- `premiumExpiresAt`
 - `authorizedAt`
-- `expiresAt`
+- `refreshedAt`
+- `leaseExpiresAt`
+- `maxExpiresAt`
 
-Only Cloud Functions write this collection. Firestore rules use it to decide
-whether a client may read/write `pairings`, `sessions`, candidates, and
-`turn_grants`.
+Only Cloud Functions write this collection. The browser UID may read its own
+document.
+
+### `web_client_mobiles/{mobileUid}`
+
+Server-written pointer that enforces one active Web Companion per mobile UID.
+
+Typical fields:
+
+- `activeWebUid`
+- `activeWebSessionId`
+- `updatedAt`
+
+Clients cannot read or write this collection.
 
 ### `pairings/{documentKey}`
 
-Purpose:
-
-- persistent shared pairing state between devices
-- mode selection and shared session pointer
+Persistent shared pairing state between devices.
 
 Typical fields:
 
@@ -72,9 +71,7 @@ Typical fields:
 
 ### `sessions/{sessionId}`
 
-Purpose:
-
-- temporary signaling document for a single connection attempt
+Temporary signaling document for one WebRTC connection attempt.
 
 Typical fields:
 
@@ -90,9 +87,7 @@ Typical fields:
 ### `sessions/{sessionId}/candidates_baby/{id}`
 ### `sessions/{sessionId}/candidates_parent/{id}`
 
-Purpose:
-
-- encrypted ICE candidate exchange
+Encrypted ICE candidate exchange.
 
 Typical fields:
 
@@ -107,54 +102,47 @@ Typical fields:
 - `campaign_codes/{slug}`
 - `campaign_redemptions/{id}`
 
-These collections are part of the public backend contract even though they are
-not represented by a dedicated Dart API in the extracted package.
-
 ## Callable Cloud Functions used by the app
 
-### `getTurnCredentials`
+### `registerMobileClient`
 
-Returns ordered ICE server credentials for TURN usage.
-Web Companion App Check app IDs are rejected here; browsers must receive TURN
-credentials only through a premium mobile peer.
+App-Check-protected callable used by Android/iOS after anonymous Firebase Auth.
+It rejects configured Web Companion App Check app IDs and sets
+`clientType: "mobile"` as a Firebase Auth custom claim.
 
-### `issuePairAccess`
+### `authorizeWebClient`
 
-Issues or refreshes mobile access to one `pairingDocKey`. The callable requires
-Firebase Auth and App Check and is intended for mobile clients after SAS
-confirmation or when a saved pairing needs to recreate server-side state.
-
-### `authorizeWebCompanion`
-
-Mobile-only callable that verifies a premium entitlement and then creates:
-
-- mobile `pair_access` for the authorising phone
-- short-lived web `pair_access` for the browser UID/session/nonce
+Mobile-only callable. It requires the mobile custom claim, verifies the mobile
+premium entitlement, revokes the previously active browser for that mobile UID,
+writes `/web_client_sessions/{webUid}`, and sets `clientType: "web"` plus
+`webSessionId` on the browser UID.
 
 Android verification uses the Play Developer API. iOS verification uses the App
 Store receipt endpoint when `APP_STORE_SHARED_SECRET` is configured. reCAPTCHA
 App Check remains browser attestation and abuse reduction, not premium
 authorization.
 
+### `refreshWebClientAuth`
+
+Web-only callable. It extends the active browser lease by 30 minutes, capped at a
+24-hour maximum authorization window. A replaced browser cannot refresh.
+
+### `getTurnCredentials`
+
+Returns ordered ICE server credentials for TURN usage. Web Companion browsers
+call this directly only after mobile authorization and ID-token refresh; TURN is
+not the authorization boundary.
+
 ### `getAppConfig`
 
 Returns remotely managed restriction flags and admin banners.
 
-### `mintGiftCode`
+### Gift and campaign callables
 
-Creates a new gift code for an active subscriber.
-
-### `redeemGiftCode`
-
-Redeems a gift code for an eligible subscription purchase.
-
-### `checkGiftCodeStatus`
-
-Polls the backend for the redemption status of outstanding codes.
-
-### `redeemCampaignCode`
-
-Applies a campaign-based billing defer for an eligible purchase.
+- `mintGiftCode`
+- `redeemGiftCode`
+- `checkGiftCodeStatus`
+- `redeemCampaignCode`
 
 ## Extracted client-side security primitives
 
@@ -170,16 +158,26 @@ Applies a campaign-based billing defer for an eligible purchase.
 
 ### Signaling contracts
 
-- Firestore collection names
-- Firestore field names
-- session and candidate status constants
+- canonical collection names for sessions and candidate subcollections
+- field names for encrypted SDP, ICE candidates, and pairing routing
 
-## Repository boundary
+### Web client session contracts
 
-This repository intentionally does **not** contain:
+- canonical collection names for active browser leases
+- field names used by Firestore rules and Cloud Functions
 
-- app UI and navigation
-- product orchestration outside the security-relevant flow
-- store and release management tooling
+## Firestore rule contract
 
-See [`public-scope.md`](public-scope.md) for a more detailed boundary description.
+- `pairing_codes`: signed-in clients may bootstrap an ECDH meeting point.
+- `sessions`, candidates, and `pairings`: allowed for mobile clients with
+  `clientType == "mobile"` or web clients with an active lease matching the
+  requested `pairingDocKey`.
+- `web_client_sessions`: readable only by the matching browser UID.
+- `web_client_mobiles`: backend-only.
+
+## Explicit non-goals
+
+- The 4-character pairing code is not an authentication secret.
+- Firebase Auth alone is not considered enough to distinguish browser and mobile
+  clients; custom claims plus server-written leases are required.
+- TURN credentials are not used as the Web Companion authorization boundary.

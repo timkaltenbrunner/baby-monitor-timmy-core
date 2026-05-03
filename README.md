@@ -76,7 +76,7 @@ More detail is available in [`docs/verification.md`](docs/verification.md).
 2. The pairing key is derived locally and never sent to the backend.
 3. SDP and ICE signaling payloads are encrypted with AES-256-GCM before they are written to Firestore.
 4. Media stays end-to-end encrypted by DTLS/SRTP once WebRTC is established.
-5. Firestore signaling writes require backend-issued `pair_access` capabilities; Web Companion browsers receive them only after a premium mobile app authorizes the session.
+5. Firestore signaling writes require either a mobile custom claim or an active Web Companion lease written by a premium mobile app.
 
 For the full technical breakdown, see:
 

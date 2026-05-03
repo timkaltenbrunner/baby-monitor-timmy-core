@@ -13,7 +13,6 @@ class PairingMeetingData {
   final String? peerType;
   final String? webUid;
   final String? webSessionId;
-  final String? webNonce;
 
   const PairingMeetingData({
     required this.exists,
@@ -22,7 +21,6 @@ class PairingMeetingData {
     this.peerType,
     this.webUid,
     this.webSessionId,
-    this.webNonce,
   });
 
   factory PairingMeetingData.fromSnapshot(
@@ -41,7 +39,6 @@ class PairingMeetingData {
       peerType: data?[PairingContract.peerTypeField] as String?,
       webUid: data?[PairingContract.webUidField] as String?,
       webSessionId: data?[PairingContract.webSessionIdField] as String?,
-      webNonce: data?[PairingContract.webNonceField] as String?,
     );
   }
 
@@ -73,7 +70,6 @@ class PairingMeetingRepository {
     required String publicKey,
     String? peerType,
     String? webSessionId,
-    String? webNonce,
   }) {
     final data = <String, dynamic>{
       PairingContract.createdAtField: FieldValue.serverTimestamp(),
@@ -85,9 +81,6 @@ class PairingMeetingRepository {
     if (webSessionId != null) {
       data[PairingContract.webUidField] = uid;
       data[PairingContract.webSessionIdField] = webSessionId;
-    }
-    if (webNonce != null) {
-      data[PairingContract.webNonceField] = webNonce;
     }
     return meetingRef(meetingKey).set(data, SetOptions(merge: true));
   }

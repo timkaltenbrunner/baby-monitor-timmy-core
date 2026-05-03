@@ -10,7 +10,6 @@ abstract final class PairingContract {
   static const webCompanionPeerType = 'web_companion';
   static const webUidField = 'webUid';
   static const webSessionIdField = 'webSessionId';
-  static const webNonceField = 'webNonce';
   static const activeSessionIdField = 'activeSessionId';
   static const selectedModeField = 'selectedMode';
   static const selectedByField = 'selectedBy';

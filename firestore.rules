@@ -1,11 +1,10 @@
 rules_version = '2';
-// Baby Monitor Timmy – Firestore Security Rules
+// Baby Monitor Timmy - Firestore Security Rules
 //
-// Signaling documents are no longer protected by "any authenticated user can
-// write". A client must hold a short-lived /pair_access capability for the
-// pairingDocKey it wants to use. Cloud Functions create these capabilities
-// after SAS confirmation; Web Companion capabilities are issued only after a
-// premium mobile peer authorizes the browser.
+// Mobile clients receive a Firebase Auth custom claim via registerMobileClient
+// (App Check protected). Web clients can only access normal signaling after a
+// premium mobile client has authorized the browser and the active lease is
+// still valid.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -23,26 +22,33 @@ service cloud.firestore {
         && pairingDocKey.matches('^[a-f0-9]{64}$');
     }
 
-    function pairAccessPath(pairingDocKey) {
-      return /databases/$(database)/documents/pair_access/$(pairingDocKey + '_' + request.auth.uid);
+    function isMobileClient() {
+      return signedIn() && request.auth.token.clientType == 'mobile';
     }
 
-    function pairAccess(pairingDocKey) {
-      return get(pairAccessPath(pairingDocKey)).data;
+    function webSessionPath() {
+      return /databases/$(database)/documents/web_client_sessions/$(request.auth.uid);
     }
 
-    function hasPairAccess(pairingDocKey) {
+    function webSession() {
+      return get(webSessionPath()).data;
+    }
+
+    function hasActiveWebSession(pairingDocKey) {
       return signedIn()
+        && request.auth.token.clientType == 'web'
         && validPairingDocKey(pairingDocKey)
-        && exists(pairAccessPath(pairingDocKey))
-        && pairAccess(pairingDocKey).pairingDocKey == pairingDocKey
-        && pairAccess(pairingDocKey).uid == request.auth.uid
-        && pairAccess(pairingDocKey).expiresAt > request.time;
+        && exists(webSessionPath())
+        && webSession().status == 'active'
+        && webSession().webUid == request.auth.uid
+        && webSession().webSessionId == request.auth.token.webSessionId
+        && webSession().pairingDocKey == pairingDocKey
+        && webSession().leaseExpiresAt > request.time
+        && webSession().maxExpiresAt > request.time;
     }
 
-    function hasMobilePairAccess(pairingDocKey) {
-      return hasPairAccess(pairingDocKey)
-        && pairAccess(pairingDocKey).role == 'mobile';
+    function canUsePairing(pairingDocKey) {
+      return isMobileClient() || hasActiveWebSession(pairingDocKey);
     }
 
     function validSessionKeys() {
@@ -76,37 +82,41 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    match /pair_access/{accessId} {
-      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+    match /web_client_sessions/{webUid} {
+      allow read: if signedIn() && request.auth.uid == webUid;
       allow write: if false;
     }
 
+    match /web_client_mobiles/{mobileUid} {
+      allow read, write: if false;
+    }
+
     match /sessions/{sessionId} {
-      allow read, delete: if hasPairAccess(resource.data.pairingDocKey);
-      allow create: if hasPairAccess(request.resource.data.pairingDocKey)
+      allow read, delete: if canUsePairing(resource.data.pairingDocKey);
+      allow create: if canUsePairing(request.resource.data.pairingDocKey)
         && request.resource.data.keys().hasAll(['pairingDocKey', 'status', 'createdAt'])
         && validSessionKeys()
         && request.resource.data.status is string;
-      allow update: if hasPairAccess(resource.data.pairingDocKey)
+      allow update: if canUsePairing(resource.data.pairingDocKey)
         && request.resource.data.pairingDocKey == resource.data.pairingDocKey
         && validSessionKeys()
         && request.resource.data.status is string;
     }
 
     match /sessions/{sessionId}/candidates_baby/{id} {
-      allow read, delete: if hasPairAccess(
+      allow read, delete: if canUsePairing(
         get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
       );
-      allow create: if hasPairAccess(
+      allow create: if canUsePairing(
         get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
       ) && validCandidatePayload();
     }
 
     match /sessions/{sessionId}/candidates_parent/{id} {
-      allow read, delete: if hasPairAccess(
+      allow read, delete: if canUsePairing(
         get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
       );
-      allow create: if hasPairAccess(
+      allow create: if canUsePairing(
         get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
       ) && validCandidatePayload();
     }
@@ -116,7 +126,7 @@ service cloud.firestore {
       allow create, update: if signedIn()
         && request.resource.data.keys().hasOnly(
              ['createdAt', 'pubkeys', 'status',
-              'peerType', 'webUid', 'webSessionId', 'webNonce'])
+              'peerType', 'webUid', 'webSessionId'])
         && request.resource.data.pubkeys is map
         && request.resource.data.pubkeys.size() <= 2
         && request.resource.data.pubkeys[request.auth.uid] is string
@@ -124,14 +134,14 @@ service cloud.firestore {
     }
 
     match /pairings/{pairingId} {
-      allow read, delete: if hasPairAccess(pairingId);
-      allow create: if hasPairAccess(pairingId)
+      allow read, delete: if canUsePairing(pairingId);
+      allow create: if canUsePairing(pairingId)
          && request.resource.data.keys().hasAll(['status', 'createdAt'])
          && request.resource.data.keys().hasOnly(
              ['status', 'createdAt', 'updatedAt', 'activeSessionId',
               'selectedMode', 'selectedBy', 'subscriptionMembers'])
          && request.resource.data.status is string;
-      allow update: if hasPairAccess(pairingId)
+      allow update: if canUsePairing(pairingId)
          && request.resource.data.keys().hasOnly(
              ['status', 'createdAt', 'updatedAt', 'activeSessionId',
               'selectedMode', 'selectedBy', 'subscriptionMembers']);
@@ -150,25 +160,6 @@ service cloud.firestore {
     match /campaign_redemptions/{id} {
       allow read: if false;
       allow write: if false;
-    }
-
-    match /turn_grants/{grantId} {
-      allow read, delete: if hasPairAccess(resource.data.pairingDocKey);
-      allow create: if hasMobilePairAccess(request.resource.data.pairingDocKey)
-        && request.resource.data.keys().hasAll(
-             ['pairingDocKey', 'encryptedPayload',
-              'expiresAtMillis', 'createdAtMillis', 'version'])
-        && request.resource.data.keys().hasOnly(
-             ['pairingDocKey', 'encryptedPayload',
-              'expiresAtMillis', 'createdAtMillis', 'version'])
-        && request.resource.data.pairingDocKey is string
-        && request.resource.data.pairingDocKey.size() == 64
-        && request.resource.data.encryptedPayload is string
-        && request.resource.data.encryptedPayload.size() < 8192
-        && request.resource.data.expiresAtMillis is int
-        && request.resource.data.createdAtMillis is int
-        && request.resource.data.version is int;
-      allow update: if false;
     }
   }
 }

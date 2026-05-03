@@ -2,21 +2,9 @@ const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const crypto = require("crypto");
-const {
-  CLOUDFLARE_TURN_BUILTIN_ID,
-  LOCAL_TURN_BUILTIN_ID,
-  DEFAULT_LOCAL_TURN_TIMEOUT_MS,
-  DEFAULT_LOCAL_TURN_TTL_SECONDS,
-  checkRateLimit,
-  isDebugPurchaseToken: isDebugPurchaseTokenGuard,
-  normalizeStringArray,
-  parsePositiveInt,
-  pickTestRunId: pickTestRunIdGuard,
-  renumberProviders,
-  sanitizeTurnProvider,
-} = require("./lib/public_helpers");
 
 initializeApp();
 
@@ -32,6 +20,10 @@ const appStoreSharedSecret = defineString("APP_STORE_SHARED_SECRET");
 const localTurnApiKey = defineSecret("LOCAL_TURN_API_KEY");
 const localTurnHmacSecret = defineSecret("LOCAL_TURN_HMAC_SECRET");
 
+const CLOUDFLARE_TURN_BUILTIN_ID = "cloudflare-builtin";
+const LOCAL_TURN_BUILTIN_ID = "local-turn-builtin";
+const DEFAULT_LOCAL_TURN_TIMEOUT_MS = 1500;
+const DEFAULT_LOCAL_TURN_TTL_SECONDS = 3600;
 const DEFAULT_CLIENT_CACHE_TTL_SECONDS = 3600;
 const DUAL_PROVIDER_CLIENT_CACHE_TTL_SECONDS = 300;
 
@@ -43,9 +35,15 @@ const DUAL_PROVIDER_CLIENT_CACHE_TTL_SECONDS = 300;
 // flows without a live Play account. Production must keep this flag unset.
 const GIFT_DEBUG_TOKENS_ALLOWED =
   process.env.GIFT_DEBUG_TOKENS_ALLOWED === "true";
+const DEBUG_TOKEN_PREFIX = "debug-e2e-";
+const TEST_RUN_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
 
 function isDebugPurchaseToken(tok) {
-  return isDebugPurchaseTokenGuard(tok, GIFT_DEBUG_TOKENS_ALLOWED);
+  return (
+    GIFT_DEBUG_TOKENS_ALLOWED &&
+    typeof tok === "string" &&
+    tok.startsWith(DEBUG_TOKEN_PREFIX)
+  );
 }
 
 /**
@@ -56,11 +54,12 @@ function isDebugPurchaseToken(tok) {
  * Returns null otherwise (production callers always get null).
  */
 function pickTestRunId(request, purchaseToken) {
-  return pickTestRunIdGuard(
-    request,
-    purchaseToken,
-    GIFT_DEBUG_TOKENS_ALLOWED
-  );
+  if (!GIFT_DEBUG_TOKENS_ALLOWED) return null;
+  if (!isDebugPurchaseToken(purchaseToken)) return null;
+  const id = request && request.data && request.data.testRunId;
+  if (typeof id !== "string") return null;
+  if (!TEST_RUN_ID_REGEX.test(id)) return null;
+  return id;
 }
 
 // ─── App Check (admin bypasses) ──────────────────────────────────────────────
@@ -84,23 +83,41 @@ function requireAdmin(request) {
 // ─── Rate limiting ───────────────────────────────────────────────────────────
 
 const rateLimitMap = new Map();
-const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_MAX = 100;
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 
 const configRateLimitMap = new Map();
 const CONFIG_RATE_LIMIT_MAX = 60;
 
-const pairAccessRateLimitMap = new Map();
-const PAIR_ACCESS_RATE_LIMIT_MAX = 60;
+const clientAuthRateLimitMap = new Map();
+const MOBILE_AUTH_RATE_LIMIT_MAX = 30;
 const WEB_ACCESS_RATE_LIMIT_MAX = 20;
 
 const WEB_COMPANION_DEFAULT_APP_IDS = [
   "1:335595248113:web:a1e763f1862f4847214c50",
 ];
-const PAIRING_DOC_KEY_REGEX = /^[a-f0-9]{64}$/;
 const WEB_ID_REGEX = /^[A-Za-z0-9_-]{12,128}$/;
 const UID_REGEX = /^[A-Za-z0-9:_-]{6,128}$/;
-const WEB_ACCESS_TTL_MS = 15 * 60 * 1000;
-const MOBILE_PAIR_ACCESS_TTL_MS = 24 * 60 * 60 * 1000;
+const PAIRING_DOC_KEY_REGEX = /^[a-f0-9]{64}$/;
+const WEB_AUTH_LEASE_MS = 30 * 60 * 1000;
+const WEB_AUTH_MAX_MS = 24 * 60 * 60 * 1000;
+
+function checkRateLimit(map, uid, max) {
+  const now = Date.now();
+  const entry = map.get(uid);
+
+  if (!entry || now >= entry.resetAt) {
+    map.set(uid, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+
+  if (entry.count >= max) {
+    return false;
+  }
+
+  entry.count++;
+  return true;
+}
 
 // ─── In-memory config cache ──────────────────────────────────────────────────
 
@@ -130,15 +147,6 @@ function isWebCompanionAppCheck(request) {
   return appId && getConfiguredWebCompanionAppIds().includes(appId);
 }
 
-function rejectWebCompanionDirectTurn(request) {
-  if (isWebCompanionAppCheck(request)) {
-    throw new HttpsError(
-      "permission-denied",
-      "Web Companion must receive TURN credentials from a premium mobile peer"
-    );
-  }
-}
-
 function validatePairingDocKey(value) {
   if (typeof value !== "string" || !PAIRING_DOC_KEY_REGEX.test(value)) {
     throw new HttpsError("invalid-argument", "Invalid pairingDocKey");
@@ -157,45 +165,30 @@ function validateUid(value, fieldName = "uid") {
   }
 }
 
-function normalizeAllowedRole(value) {
-  const role = String(value || "").trim().toLowerCase();
-  if (!["baby", "parent", "any"].includes(role)) {
-    throw new HttpsError("invalid-argument", "Invalid allowedRole");
+function normalizeStringArray(rawValue) {
+  if (Array.isArray(rawValue)) {
+    return rawValue
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
   }
-  return role;
+  const value = String(rawValue || "").trim();
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
-function pairAccessDocId(pairingDocKey, uid) {
-  return `${pairingDocKey}_${uid}`;
+function parsePositiveInt(rawValue, fallback) {
+  const parsed = Number.parseInt(String(rawValue ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-async function writePairAccess({
-  pairingDocKey,
-  uid,
-  role,
-  allowedRole = "any",
-  ttlMs,
-  webSessionId = null,
-  webNonce = null,
-  mobileUid = null,
-}) {
-  const db = getFirestore();
-  const expiresAt = new Date(Date.now() + ttlMs);
-  const accessId = pairAccessDocId(pairingDocKey, uid);
-  const body = {
-    pairingDocKey,
-    uid,
-    role,
-    allowedRole,
-    createdAt: FieldValue.serverTimestamp(),
-    authorizedAt: FieldValue.serverTimestamp(),
-    expiresAt,
-  };
-  if (webSessionId) body.webSessionId = webSessionId;
-  if (webNonce) body.webNonce = webNonce;
-  if (mobileUid) body.mobileUid = mobileUid;
-  await db.collection("pair_access").doc(accessId).set(body, { merge: true });
-  return { accessId, expiresAtMillis: expiresAt.getTime() };
+function renumberProviders(providers) {
+  return providers.map((provider, index) => ({
+    ...provider,
+    priority: index + 1,
+  }));
 }
 
 function buildCloudflareBuiltinProvider(priority = 2) {
@@ -245,6 +238,89 @@ function mergeProviderWithDefaults(provider, defaults) {
       ...(provider.config || {}),
     },
   };
+}
+
+function sanitizeTurnProvider(provider) {
+  if (!provider || typeof provider !== "object") {
+    return null;
+  }
+
+  const id = String(provider.id || "").trim();
+  const type = String(provider.type || "").trim();
+  const name = String(provider.name || "").trim();
+  const enabled = provider.enabled !== false;
+  const priority = parsePositiveInt(provider.priority, 99);
+
+  if (id === CLOUDFLARE_TURN_BUILTIN_ID || type === "cloudflare") {
+    return {
+      id: CLOUDFLARE_TURN_BUILTIN_ID,
+      name: name || "Cloudflare TURN",
+      type: "cloudflare",
+      enabled,
+      priority,
+      builtin: true,
+      config: {
+        ttl: parsePositiveInt(provider.config?.ttl, 86400),
+      },
+    };
+  }
+
+  if (id === LOCAL_TURN_BUILTIN_ID || type === "local-rest") {
+    return {
+      id: LOCAL_TURN_BUILTIN_ID,
+      name: name || "Lokaler TURN",
+      type: "local-rest",
+      enabled,
+      priority,
+      builtin: true,
+      config: {
+        urls: normalizeStringArray(provider.config?.urls),
+        ttl: parsePositiveInt(
+          provider.config?.ttl,
+          DEFAULT_LOCAL_TURN_TTL_SECONDS
+        ),
+        timeoutMs: parsePositiveInt(
+          provider.config?.timeoutMs,
+          DEFAULT_LOCAL_TURN_TIMEOUT_MS
+        ),
+      },
+    };
+  }
+
+  if (type === "hmac-secret") {
+    return {
+      id: id || `turn-hmac-${Date.now()}`,
+      name: name || "TURN (HMAC)",
+      type: "hmac-secret",
+      enabled,
+      priority,
+      builtin: false,
+      config: {
+        urls: normalizeStringArray(provider.config?.urls),
+        secret: String(provider.config?.secret || "").trim(),
+        ttl: parsePositiveInt(provider.config?.ttl, 86400),
+        realm: String(provider.config?.realm || "").trim(),
+      },
+    };
+  }
+
+  if (type === "static") {
+    return {
+      id: id || `turn-${Date.now()}`,
+      name: name || "Custom TURN",
+      type: "static",
+      enabled,
+      priority,
+      builtin: false,
+      config: {
+        urls: normalizeStringArray(provider.config?.urls),
+        username: String(provider.config?.username || "").trim(),
+        credential: String(provider.config?.credential || "").trim(),
+      },
+    };
+  }
+
+  return null;
 }
 
 function buildProviderList(storedProviders = []) {
@@ -719,7 +795,6 @@ exports.getTurnCredentials = onCall(
       throw new HttpsError("unauthenticated", "Must be authenticated");
     }
     requireAppCheck(request);
-    rejectWebCompanionDirectTurn(request);
 
     if (!checkRateLimit(rateLimitMap, request.auth.uid, RATE_LIMIT_MAX)) {
       throw new HttpsError("resource-exhausted", "Rate limit exceeded");
@@ -1522,6 +1597,8 @@ exports.snapshotSessionStats = onSchedule(
     let active = 0;
     let premium = 0;
     let free = 0;
+    let connectionIssues = 0;
+    let turnChanges = 0;
     const byBabyProvider = {};
     const byParentProvider = {};
     const byProvider = {}; // any side using a given provider (union)
@@ -1537,6 +1614,8 @@ exports.snapshotSessionStats = onSchedule(
         else if (d.status === "active") active++;
         if (d.babyPremium === true || d.parentPremium === true) premium++;
         else free++;
+        connectionIssues += Number(d.connectionInterruptionCount || 0);
+        turnChanges += Number(d.turnChangeCount || 0);
 
         const babyP = d.babyTurnProvider;
         const parentP = d.parentTurnProvider;
@@ -1565,6 +1644,8 @@ exports.snapshotSessionStats = onSchedule(
           active,
           premium,
           free,
+          connectionIssues,
+          turnChanges,
           byProvider,
           byBabyProvider,
           byParentProvider,
@@ -1578,6 +1659,8 @@ exports.snapshotSessionStats = onSchedule(
           {
             lastSnapshotAt: now,
             lastTotal: total,
+            lastConnectionIssues: connectionIssues,
+            lastTurnChanges: turnChanges,
             lastByProvider: byProvider,
           },
           { merge: true },
@@ -1643,6 +1726,8 @@ exports.getSessionStats = onCall({}, async (request) => {
       active: d.active || 0,
       premium: d.premium || 0,
       free: d.free || 0,
+      connectionIssues: d.connectionIssues || 0,
+      turnChanges: d.turnChanges || 0,
       byProvider: d.byProvider || {},
       byBabyProvider: d.byBabyProvider || {},
       byParentProvider: d.byParentProvider || {},
@@ -1944,45 +2029,113 @@ async function verifyPremiumProof(proof) {
   throw new HttpsError("invalid-argument", "Unsupported premium proof platform");
 }
 
-exports.issuePairAccess = onCall(
+async function setClientClaims(uid, patch) {
+  const auth = getAuth();
+  const user = await auth.getUser(uid);
+  const existing = user.customClaims || {};
+  await auth.setCustomUserClaims(uid, { ...existing, ...patch });
+}
+
+function requireMobileClient(request) {
+  requireAuth(request);
+  if (request.auth.token?.clientType !== "mobile") {
+    throw new HttpsError("permission-denied", "Mobile client claim required");
+  }
+}
+
+async function writeActiveWebClientSession({
+  mobileUid,
+  webUid,
+  webSessionId,
+  pairingDocKey,
+  premium,
+}) {
+  const db = getFirestore();
+  const now = Date.now();
+  const leaseExpiresAt = new Date(now + WEB_AUTH_LEASE_MS);
+  const maxExpiresAt = new Date(now + WEB_AUTH_MAX_MS);
+  const mobileRef = db.collection("web_client_mobiles").doc(mobileUid);
+  const newSessionRef = db.collection("web_client_sessions").doc(webUid);
+
+  await db.runTransaction(async (tx) => {
+    const mobileSnap = await tx.get(mobileRef);
+    const previousUid = mobileSnap.exists ? mobileSnap.get("activeWebUid") : null;
+    if (previousUid && previousUid !== webUid) {
+      tx.set(
+        db.collection("web_client_sessions").doc(previousUid),
+        {
+          status: "revoked",
+          revokedAt: FieldValue.serverTimestamp(),
+          replacedByWebUid: webUid,
+        },
+        { merge: true }
+      );
+    }
+
+    tx.set(newSessionRef, {
+      status: "active",
+      mobileUid,
+      webUid,
+      webSessionId,
+      pairingDocKey,
+      premiumSource: premium.source,
+      premiumExpiresAt: new Date(premium.expiryMillis),
+      authorizedAt: FieldValue.serverTimestamp(),
+      refreshedAt: FieldValue.serverTimestamp(),
+      leaseExpiresAt,
+      maxExpiresAt,
+    });
+    tx.set(mobileRef, {
+      activeWebUid: webUid,
+      activeWebSessionId: webSessionId,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  });
+
+  await setClientClaims(webUid, {
+    clientType: "web",
+    webSessionId,
+  });
+
+  return {
+    leaseExpiresAtMillis: leaseExpiresAt.getTime(),
+    maxExpiresAtMillis: maxExpiresAt.getTime(),
+  };
+}
+
+exports.registerMobileClient = onCall(
   {},
   async (request) => {
     requireAppCheck(request);
-    rejectWebCompanionDirectTurn(request);
     requireAuth(request);
+    if (isWebCompanionAppCheck(request)) {
+      throw new HttpsError("permission-denied", "Web clients cannot register as mobile clients");
+    }
     if (
       !checkRateLimit(
-        pairAccessRateLimitMap,
-        request.auth.uid,
-        PAIR_ACCESS_RATE_LIMIT_MAX
+        clientAuthRateLimitMap,
+        `mobile:${request.auth.uid}`,
+        MOBILE_AUTH_RATE_LIMIT_MAX
       )
     ) {
-      throw new HttpsError("resource-exhausted", "Too many pair access requests");
+      throw new HttpsError("resource-exhausted", "Too many mobile auth requests");
     }
 
-    const pairingDocKey = request.data?.pairingDocKey;
-    validatePairingDocKey(pairingDocKey);
-
-    const result = await writePairAccess({
-      pairingDocKey,
-      uid: request.auth.uid,
-      role: "mobile",
-      allowedRole: "any",
-      ttlMs: MOBILE_PAIR_ACCESS_TTL_MS,
+    await setClientClaims(request.auth.uid, {
+      clientType: "mobile",
     });
-    return { ok: true, role: "mobile", ...result };
+    return { ok: true, clientType: "mobile" };
   }
 );
 
-exports.authorizeWebCompanion = onCall(
+exports.authorizeWebClient = onCall(
   { secrets: [playServiceAccountJson] },
   async (request) => {
     requireAppCheck(request);
-    rejectWebCompanionDirectTurn(request);
-    requireAuth(request);
+    requireMobileClient(request);
     if (
       !checkRateLimit(
-        pairAccessRateLimitMap,
+        clientAuthRateLimitMap,
         `web:${request.auth.uid}`,
         WEB_ACCESS_RATE_LIMIT_MAX
       )
@@ -1993,42 +2146,66 @@ exports.authorizeWebCompanion = onCall(
     const pairingDocKey = request.data?.pairingDocKey;
     const webUid = request.data?.webUid;
     const webSessionId = request.data?.webSessionId;
-    const webNonce = request.data?.webNonce;
-    const allowedRole = normalizeAllowedRole(request.data?.allowedRole);
-
     validatePairingDocKey(pairingDocKey);
     validateUid(webUid, "webUid");
     validateWebField(webSessionId, "webSessionId");
-    validateWebField(webNonce, "webNonce");
 
     const premium = await verifyPremiumProof(request.data?.premiumProof);
-
-    const mobileAccess = await writePairAccess({
-      pairingDocKey,
-      uid: request.auth.uid,
-      role: "mobile",
-      allowedRole: "any",
-      ttlMs: MOBILE_PAIR_ACCESS_TTL_MS,
-    });
-    const webAccess = await writePairAccess({
-      pairingDocKey,
-      uid: webUid,
-      role: "web",
-      allowedRole,
-      ttlMs: WEB_ACCESS_TTL_MS,
-      webSessionId,
-      webNonce,
+    const session = await writeActiveWebClientSession({
       mobileUid: request.auth.uid,
+      webUid,
+      webSessionId,
+      pairingDocKey,
+      premium,
     });
 
     return {
       ok: true,
-      webAccessId: webAccess.accessId,
-      webAccessExpiresAtMillis: webAccess.expiresAtMillis,
-      mobileAccessId: mobileAccess.accessId,
+      webUid,
+      webSessionId,
       premiumSource: premium.source,
       premiumExpiresAtMillis: premium.expiryMillis,
+      ...session,
     };
+  }
+);
+
+exports.refreshWebClientAuth = onCall(
+  {},
+  async (request) => {
+    requireAppCheck(request);
+    requireAuth(request);
+    const webSessionId = request.auth.token?.webSessionId;
+    if (request.auth.token?.clientType !== "web" || typeof webSessionId !== "string") {
+      throw new HttpsError("permission-denied", "Web client claim required");
+    }
+
+    const db = getFirestore();
+    const ref = db.collection("web_client_sessions").doc(request.auth.uid);
+    const snap = await ref.get();
+    if (!snap.exists || snap.get("status") !== "active") {
+      throw new HttpsError("permission-denied", "Web session is not active");
+    }
+    if (snap.get("webSessionId") !== webSessionId) {
+      throw new HttpsError("permission-denied", "Web session was replaced");
+    }
+
+    const max = snap.get("maxExpiresAt");
+    const maxMs = max?.toMillis ? max.toMillis() : 0;
+    const nextMs = Math.min(Date.now() + WEB_AUTH_LEASE_MS, maxMs);
+    if (!nextMs || nextMs <= Date.now()) {
+      await ref.set({
+        status: "expired",
+        expiredAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      throw new HttpsError("permission-denied", "Web session expired");
+    }
+
+    await ref.set({
+      refreshedAt: FieldValue.serverTimestamp(),
+      leaseExpiresAt: new Date(nextMs),
+    }, { merge: true });
+    return { ok: true, leaseExpiresAtMillis: nextMs };
   }
 );
 
