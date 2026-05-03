@@ -257,8 +257,12 @@ Restored `com.babymonitortimmy.app/install_referrer` MethodChannel.
 
 1. Create service account `play-developer-api-defer` in Google Cloud.
    Download JSON key.
-2. Play Console → Users → invite the service-account email; grant
-   *Manage orders and subscriptions* on the app.
+2. Play Console → Users → invite the service-account email; grant on the
+   app:
+   * *View financial data* (required for Purchases API / subscription
+     verification)
+   * *Manage orders and subscriptions* (required for gift/campaign defer
+     flows)
 3. Firebase Secret Manager:
    ```powershell
    firebase functions:secrets:set PLAY_DEVELOPER_SERVICE_ACCOUNT_JSON < key.json --project baby-monitor-timmy

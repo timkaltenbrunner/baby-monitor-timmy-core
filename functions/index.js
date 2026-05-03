@@ -1860,7 +1860,8 @@ function playApiPermissionHint(status) {
     `Play API unauthorized (${status}) for ${_playServiceAccountEmail}. ` +
     "Grant this service account access to com.babymonitortimmy.app in Play Console -> Users and permissions";
   return status === 401 || status === 403 ?
-    `${base} and enable \"Manage orders and subscriptions\".` :
+    `${base} and enable \"View financial data\" for Purchases API access. ` +
+    "\"Manage orders and subscriptions\" is still needed for gift/campaign defer flows." :
     null;
 }
 
