@@ -1852,7 +1852,17 @@ function sha256Hex(s) {
 
 let _playAuthClient = null;
 let _playAuthClientLoadedAt = 0;
+let _playServiceAccountEmail = "unknown-service-account";
 const PLAY_AUTH_CACHE_MS = 50 * 60 * 1000;
+
+function playApiPermissionHint(status) {
+  const base =
+    `Play API unauthorized (${status}) for ${_playServiceAccountEmail}. ` +
+    "Grant this service account access to com.babymonitortimmy.app in Play Console -> Users and permissions";
+  return status === 401 || status === 403 ?
+    `${base} and enable \"Manage orders and subscriptions\".` :
+    null;
+}
 
 async function getPlayApiClient() {
   const now = Date.now();
@@ -1869,6 +1879,7 @@ async function getPlayApiClient() {
   } catch (e) {
     throw new HttpsError("failed-precondition", "Play service account JSON malformed");
   }
+  _playServiceAccountEmail = credentials.client_email || "unknown-service-account";
   const auth = new GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/androidpublisher"],
@@ -1897,7 +1908,8 @@ async function getPlaySubscription(packageName, subscriptionId, purchaseToken) {
   }
   if (res.status >= 400) {
     console.error("[Play] getSubscription failed", res.status, res.data);
-    throw new HttpsError("internal", "Play API error: " + res.status);
+    const hint = playApiPermissionHint(res.status);
+    throw new HttpsError(hint ? "failed-precondition" : "internal", hint || ("Play API error: " + res.status));
   }
   return res.data;
 }
@@ -1930,7 +1942,8 @@ async function deferPlaySubscription(packageName, subscriptionId, purchaseToken,
   });
   if (res.status >= 400) {
     console.error("[Play] defer failed", res.status, res.data);
-    throw new HttpsError("internal", "Play defer failed: " + res.status);
+    const hint = playApiPermissionHint(res.status);
+    throw new HttpsError(hint ? "failed-precondition" : "internal", hint || ("Play defer failed: " + res.status));
   }
   return res.data; // { newExpiryTimeMillis }
 }
