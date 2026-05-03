@@ -94,7 +94,7 @@ service cloud.firestore {
     match /sessions/{sessionId} {
       allow read, delete: if canUsePairing(resource.data.pairingDocKey);
       allow create: if canUsePairing(request.resource.data.pairingDocKey)
-        && request.resource.data.keys().hasAll(['pairingDocKey', 'status', 'createdAt'])
+        && request.resource.data.keys().hasAll(['pairingDocKey', 'status'])
         && validSessionKeys()
         && request.resource.data.status is string;
       allow update: if canUsePairing(resource.data.pairingDocKey)
