@@ -6,6 +6,11 @@ abstract final class PairingContract {
   static const updatedAtField = 'updatedAt';
   static const statusField = 'status';
   static const pubkeysField = 'pubkeys';
+  static const peerTypeField = 'peerType';
+  static const webCompanionPeerType = 'web_companion';
+  static const webUidField = 'webUid';
+  static const webSessionIdField = 'webSessionId';
+  static const webNonceField = 'webNonce';
   static const activeSessionIdField = 'activeSessionId';
   static const selectedModeField = 'selectedMode';
   static const selectedByField = 'selectedBy';

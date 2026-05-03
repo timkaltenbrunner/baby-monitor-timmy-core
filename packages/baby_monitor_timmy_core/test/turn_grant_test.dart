@@ -19,6 +19,8 @@ void main() {
         issuedAt: DateTime.utc(2026, 5, 3, 12, 0, 0),
         expiresAt: DateTime.utc(2026, 5, 3, 12, 5, 0),
         mobileNonce: 'nonce-xyz',
+        webNonce: 'web-nonce-abc',
+        accessId: 'access-123',
         providerHint: 'local',
       );
 
@@ -33,6 +35,8 @@ void main() {
       expect(restored.issuedAt, original.issuedAt);
       expect(restored.expiresAt, original.expiresAt);
       expect(restored.mobileNonce, original.mobileNonce);
+      expect(restored.webNonce, original.webNonce);
+      expect(restored.accessId, original.accessId);
       expect(restored.providerHint, original.providerHint);
       expect(restored.version, TurnGrant.currentVersion);
     });
@@ -77,8 +81,10 @@ void main() {
         notBefore: DateTime.utc(2026, 1, 2),
         expiresAt: DateTime.utc(2026, 1, 3),
         mobileNonce: 'n',
+        webNonce: 'w',
       );
-      expect(grant.isCurrentlyValid(now: DateTime.utc(2026, 1, 1, 12)), isFalse);
+      expect(
+          grant.isCurrentlyValid(now: DateTime.utc(2026, 1, 1, 12)), isFalse);
       expect(grant.isCurrentlyValid(now: DateTime.utc(2026, 1, 2, 12)), isTrue);
       expect(grant.isCurrentlyValid(now: DateTime.utc(2026, 1, 3, 1)), isFalse);
     });

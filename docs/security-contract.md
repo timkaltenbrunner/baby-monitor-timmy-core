@@ -22,6 +22,36 @@ Typical fields:
 - `createdAt`
 - `status`
 - `pubkeys`
+- optional Web Companion metadata: `peerType`, `webUid`, `webSessionId`, `webNonce`
+
+The meeting point is still an unauthorised ECDH rendezvous. Public-key
+replacement is detected by mandatory SAS verification; the server does not treat
+the 4-character code as a security secret.
+
+### `pair_access/{pairingDocKey}_{uid}`
+
+Purpose:
+
+- backend-issued, short-lived Firestore access capability
+- binds a Firebase Auth UID to one `pairingDocKey`
+- differentiates mobile access from Web Companion browser access
+
+Typical fields:
+
+- `pairingDocKey`
+- `uid`
+- `role` (`mobile` or `web`)
+- `allowedRole` (`baby`, `parent`, or `any`)
+- `webSessionId`
+- `webNonce`
+- `mobileUid`
+- `createdAt`
+- `authorizedAt`
+- `expiresAt`
+
+Only Cloud Functions write this collection. Firestore rules use it to decide
+whether a client may read/write `pairings`, `sessions`, candidates, and
+`turn_grants`.
 
 ### `pairings/{documentKey}`
 
@@ -85,6 +115,26 @@ not represented by a dedicated Dart API in the extracted package.
 ### `getTurnCredentials`
 
 Returns ordered ICE server credentials for TURN usage.
+Web Companion App Check app IDs are rejected here; browsers must receive TURN
+credentials only through a premium mobile peer.
+
+### `issuePairAccess`
+
+Issues or refreshes mobile access to one `pairingDocKey`. The callable requires
+Firebase Auth and App Check and is intended for mobile clients after SAS
+confirmation or when a saved pairing needs to recreate server-side state.
+
+### `authorizeWebCompanion`
+
+Mobile-only callable that verifies a premium entitlement and then creates:
+
+- mobile `pair_access` for the authorising phone
+- short-lived web `pair_access` for the browser UID/session/nonce
+
+Android verification uses the Play Developer API. iOS verification uses the App
+Store receipt endpoint when `APP_STORE_SHARED_SECRET` is configured. reCAPTCHA
+App Check remains browser attestation and abuse reduction, not premium
+authorization.
 
 ### `getAppConfig`
 

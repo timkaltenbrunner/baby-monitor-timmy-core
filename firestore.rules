@@ -1,127 +1,174 @@
 rules_version = '2';
 // Baby Monitor Timmy – Firestore Security Rules
 //
-// Access model: Any authenticated user can read/write any document.
-// This is BY DESIGN — the document path (SHA-256 hash of pairing key)
-// IS the secret. Both devices compute the same hash independently.
-// Data validation rules below prevent malformed or oversized writes.
-//
-// Admin collection: mostly readable by authenticated users, write only by admin UID.
-// Exception: /admin/turn_config is admin-only because it can contain TURN secrets.
+// Signaling documents are no longer protected by "any authenticated user can
+// write". A client must hold a short-lived /pair_access capability for the
+// pairingDocKey it wants to use. Cloud Functions create these capabilities
+// after SAS confirmation; Web Companion capabilities are issued only after a
+// premium mobile peer authorizes the browser.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Admin UID for write access to admin collection
+    function signedIn() {
+      return request.auth != null;
+    }
+
     function isAdmin() {
-      return request.auth != null
+      return signedIn()
         && request.auth.uid == 'DcyIopcaDjUCcHbUhx0VHYM8hZ33';
     }
 
-    // TURN config can contain provider credentials and API keys.
-    // Keep it admin-only; app clients receive only short-lived credentials
-    // through Cloud Functions.
+    function validPairingDocKey(pairingDocKey) {
+      return pairingDocKey is string
+        && pairingDocKey.matches('^[a-f0-9]{64}$');
+    }
+
+    function pairAccessPath(pairingDocKey) {
+      return /databases/$(database)/documents/pair_access/$(pairingDocKey + '_' + request.auth.uid);
+    }
+
+    function pairAccess(pairingDocKey) {
+      return get(pairAccessPath(pairingDocKey)).data;
+    }
+
+    function hasPairAccess(pairingDocKey) {
+      return signedIn()
+        && validPairingDocKey(pairingDocKey)
+        && exists(pairAccessPath(pairingDocKey))
+        && pairAccess(pairingDocKey).pairingDocKey == pairingDocKey
+        && pairAccess(pairingDocKey).uid == request.auth.uid
+        && pairAccess(pairingDocKey).expiresAt > request.time;
+    }
+
+    function hasMobilePairAccess(pairingDocKey) {
+      return hasPairAccess(pairingDocKey)
+        && pairAccess(pairingDocKey).role == 'mobile';
+    }
+
+    function validSessionKeys() {
+      return request.resource.data.keys().hasOnly(
+        ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
+         'createdAt', 'updatedAt', 'version', 'signalingClearedAt',
+         'babyPremium', 'parentPremium',
+         'babyTurnProvider', 'babyTurnProviders',
+         'parentTurnProvider', 'parentTurnProviders',
+         'babyActiveTurnUrl', 'babyActiveTurnProtocol', 'babyActiveTurnProvider',
+         'parentActiveTurnUrl', 'parentActiveTurnProtocol', 'parentActiveTurnProvider',
+         'qualityEventCount', 'qualityEventsTail', 'lastQualityEvent',
+         'connectionInterruptionCount', 'lastConnectionIssue',
+         'turnChangeCount', 'lastTurnChange']);
+    }
+
+    function validCandidatePayload() {
+      return request.resource.data.keys().hasAll(['candidate', 'ts'])
+        && request.resource.data.keys().hasOnly(
+             ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
+        && request.resource.data.candidate is string
+        && request.resource.data.candidate.size() < 8192;
+    }
+
     match /admin/turn_config {
       allow read, write: if isAdmin();
     }
 
-    // Other admin config remains readable by authenticated clients and
-    // writable only by admin.
     match /admin/{document=**} {
-      allow read: if request.auth != null;
+      allow read: if signedIn();
       allow write: if isAdmin();
     }
 
-    // Sessions: ephemeral WebRTC signaling documents
+    match /pair_access/{accessId} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow write: if false;
+    }
+
     match /sessions/{sessionId} {
-      allow read, delete: if request.auth != null;
-      allow create: if request.auth != null
-        && request.resource.data.keys().hasAll(['status', 'createdAt'])
-        && request.resource.data.keys().hasOnly(
-             ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
-              'createdAt', 'updatedAt', 'version',
-              'babyPremium', 'parentPremium',
-              'babyTurnProvider', 'babyTurnProviders',
-              'parentTurnProvider', 'parentTurnProviders',
-              'babyActiveTurnUrl', 'babyActiveTurnProtocol', 'babyActiveTurnProvider',
-              'parentActiveTurnUrl', 'parentActiveTurnProtocol', 'parentActiveTurnProvider'])
+      allow read, delete: if hasPairAccess(resource.data.pairingDocKey);
+      allow create: if hasPairAccess(request.resource.data.pairingDocKey)
+        && request.resource.data.keys().hasAll(['pairingDocKey', 'status', 'createdAt'])
+        && validSessionKeys()
         && request.resource.data.status is string;
-      allow update: if request.auth != null
-        && request.resource.data.keys().hasOnly(
-             ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
-              'createdAt', 'updatedAt', 'version',
-              'babyPremium', 'parentPremium',
-              'babyTurnProvider', 'babyTurnProviders',
-              'parentTurnProvider', 'parentTurnProviders',
-              'babyActiveTurnUrl', 'babyActiveTurnProtocol', 'babyActiveTurnProvider',
-              'parentActiveTurnUrl', 'parentActiveTurnProtocol', 'parentActiveTurnProvider'])
+      allow update: if hasPairAccess(resource.data.pairingDocKey)
+        && request.resource.data.pairingDocKey == resource.data.pairingDocKey
+        && validSessionKeys()
         && request.resource.data.status is string;
     }
 
-    // ICE candidates from baby device
     match /sessions/{sessionId}/candidates_baby/{id} {
-      allow read, delete: if request.auth != null;
-      allow create: if request.auth != null
-        && request.resource.data.keys().hasAll(['candidate', 'ts'])
-        && request.resource.data.keys().hasOnly(
-             ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
-        && request.resource.data.candidate is string;
+      allow read, delete: if hasPairAccess(
+        get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
+      );
+      allow create: if hasPairAccess(
+        get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
+      ) && validCandidatePayload();
     }
 
-    // ICE candidates from parent device
     match /sessions/{sessionId}/candidates_parent/{id} {
-      allow read, delete: if request.auth != null;
-      allow create: if request.auth != null
-        && request.resource.data.keys().hasAll(['candidate', 'ts'])
-        && request.resource.data.keys().hasOnly(
-             ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
-        && request.resource.data.candidate is string;
+      allow read, delete: if hasPairAccess(
+        get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
+      );
+      allow create: if hasPairAccess(
+        get(/databases/$(database)/documents/sessions/$(sessionId)).data.pairingDocKey
+      ) && validCandidatePayload();
     }
 
-    // Pairing codes: ECDH key exchange meeting points
     match /pairing_codes/{code} {
-      allow read, delete: if request.auth != null;
-      allow create: if request.auth != null
+      allow read, delete: if signedIn();
+      allow create, update: if signedIn()
         && request.resource.data.keys().hasOnly(
-             ['createdAt', 'pubkeys', 'status']);
-      allow update: if request.auth != null
-        && request.resource.data.keys().hasOnly(
-             ['createdAt', 'pubkeys', 'status']);
+             ['createdAt', 'pubkeys', 'status',
+              'peerType', 'webUid', 'webSessionId', 'webNonce'])
+        && request.resource.data.pubkeys is map
+        && request.resource.data.pubkeys.size() <= 2
+        && request.resource.data.pubkeys[request.auth.uid] is string
+        && request.resource.data.pubkeys[request.auth.uid].size() < 512;
     }
 
-    // Pairings: persistent pairing state for mode selection
     match /pairings/{pairingId} {
-      allow read, delete: if request.auth != null;
-      allow create: if request.auth != null
+      allow read, delete: if hasPairAccess(pairingId);
+      allow create: if hasPairAccess(pairingId)
          && request.resource.data.keys().hasAll(['status', 'createdAt'])
          && request.resource.data.keys().hasOnly(
              ['status', 'createdAt', 'updatedAt', 'activeSessionId',
-               'selectedMode', 'selectedBy', 'subscriptionMembers'])
+              'selectedMode', 'selectedBy', 'subscriptionMembers'])
          && request.resource.data.status is string;
-      allow update: if request.auth != null
+      allow update: if hasPairAccess(pairingId)
          && request.resource.data.keys().hasOnly(
              ['status', 'createdAt', 'updatedAt', 'activeSessionId',
-               'selectedMode', 'selectedBy', 'subscriptionMembers']);
+              'selectedMode', 'selectedBy', 'subscriptionMembers']);
     }
 
-    // Gift codes (user-to-user). Authenticated clients may read (sharer
-    // polls status of own codes; recipient validates code before redeem).
-    // Only the Cloud Functions Admin SDK writes.
     match /gift_codes/{nonce} {
-      allow read: if request.auth != null;
+      allow read: if signedIn();
       allow write: if false;
     }
 
-    // Campaign codes (one-to-many ad campaigns). Clients read to validate
-    // a slug before submitting. Admin curates docs directly.
     match /campaign_codes/{slug} {
-      allow read: if request.auth != null;
+      allow read: if signedIn();
       allow write: if isAdmin();
     }
 
-    // Campaign redemptions (idempotency ledger). Server-only.
     match /campaign_redemptions/{id} {
       allow read: if false;
       allow write: if false;
+    }
+
+    match /turn_grants/{grantId} {
+      allow read, delete: if hasPairAccess(resource.data.pairingDocKey);
+      allow create: if hasMobilePairAccess(request.resource.data.pairingDocKey)
+        && request.resource.data.keys().hasAll(
+             ['pairingDocKey', 'encryptedPayload',
+              'expiresAtMillis', 'createdAtMillis', 'version'])
+        && request.resource.data.keys().hasOnly(
+             ['pairingDocKey', 'encryptedPayload',
+              'expiresAtMillis', 'createdAtMillis', 'version'])
+        && request.resource.data.pairingDocKey is string
+        && request.resource.data.pairingDocKey.size() == 64
+        && request.resource.data.encryptedPayload is string
+        && request.resource.data.encryptedPayload.size() < 8192
+        && request.resource.data.expiresAtMillis is int
+        && request.resource.data.createdAtMillis is int
+        && request.resource.data.version is int;
+      allow update: if false;
     }
   }
 }

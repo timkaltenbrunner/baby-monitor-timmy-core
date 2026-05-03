@@ -10,11 +10,19 @@ class PairingMeetingData {
   final bool exists;
   final String? status;
   final Map<String, String> pubkeys;
+  final String? peerType;
+  final String? webUid;
+  final String? webSessionId;
+  final String? webNonce;
 
   const PairingMeetingData({
     required this.exists,
     required this.status,
     required this.pubkeys,
+    this.peerType,
+    this.webUid,
+    this.webSessionId,
+    this.webNonce,
   });
 
   factory PairingMeetingData.fromSnapshot(
@@ -30,6 +38,10 @@ class PairingMeetingData {
       pubkeys: rawPubkeys.map(
         (key, value) => MapEntry(key, value.toString()),
       ),
+      peerType: data?[PairingContract.peerTypeField] as String?,
+      webUid: data?[PairingContract.webUidField] as String?,
+      webSessionId: data?[PairingContract.webSessionIdField] as String?,
+      webNonce: data?[PairingContract.webNonceField] as String?,
     );
   }
 
@@ -59,11 +71,25 @@ class PairingMeetingRepository {
     required String meetingKey,
     required String uid,
     required String publicKey,
+    String? peerType,
+    String? webSessionId,
+    String? webNonce,
   }) {
-    return meetingRef(meetingKey).set({
+    final data = <String, dynamic>{
       PairingContract.createdAtField: FieldValue.serverTimestamp(),
       PairingContract.pubkeysField: {uid: publicKey},
-    }, SetOptions(merge: true));
+    };
+    if (peerType != null) {
+      data[PairingContract.peerTypeField] = peerType;
+    }
+    if (webSessionId != null) {
+      data[PairingContract.webUidField] = uid;
+      data[PairingContract.webSessionIdField] = webSessionId;
+    }
+    if (webNonce != null) {
+      data[PairingContract.webNonceField] = webNonce;
+    }
+    return meetingRef(meetingKey).set(data, SetOptions(merge: true));
   }
 
   Stream<PairingMeetingData> watchMeetingPoint(String meetingKey) {

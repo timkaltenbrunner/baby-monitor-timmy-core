@@ -27,6 +27,8 @@ const cfAccountId = defineString("CLOUDFLARE_ACCOUNT_ID");
 const adminUid = defineString("ADMIN_UID");
 const localTurnApiBaseUrl = defineString("LOCAL_TURN_API_BASE_URL");
 const localTurnPublicUrls = defineString("LOCAL_TURN_PUBLIC_URLS");
+const webCompanionAppIds = defineString("WEB_COMPANION_APP_IDS");
+const appStoreSharedSecret = defineString("APP_STORE_SHARED_SECRET");
 const localTurnApiKey = defineSecret("LOCAL_TURN_API_KEY");
 const localTurnHmacSecret = defineSecret("LOCAL_TURN_HMAC_SECRET");
 
@@ -87,6 +89,19 @@ const RATE_LIMIT_MAX = 10;
 const configRateLimitMap = new Map();
 const CONFIG_RATE_LIMIT_MAX = 60;
 
+const pairAccessRateLimitMap = new Map();
+const PAIR_ACCESS_RATE_LIMIT_MAX = 60;
+const WEB_ACCESS_RATE_LIMIT_MAX = 20;
+
+const WEB_COMPANION_DEFAULT_APP_IDS = [
+  "1:335595248113:web:a1e763f1862f4847214c50",
+];
+const PAIRING_DOC_KEY_REGEX = /^[a-f0-9]{64}$/;
+const WEB_ID_REGEX = /^[A-Za-z0-9_-]{12,128}$/;
+const UID_REGEX = /^[A-Za-z0-9:_-]{6,128}$/;
+const WEB_ACCESS_TTL_MS = 15 * 60 * 1000;
+const MOBILE_PAIR_ACCESS_TTL_MS = 24 * 60 * 60 * 1000;
+
 // ─── In-memory config cache ──────────────────────────────────────────────────
 
 let _turnConfigCache = null;
@@ -100,6 +115,87 @@ function safeParamValue(param) {
   } catch (error) {
     return "";
   }
+}
+
+function getConfiguredWebCompanionAppIds() {
+  const configured = String(safeParamValue(webCompanionAppIds) || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return configured.length > 0 ? configured : WEB_COMPANION_DEFAULT_APP_IDS;
+}
+
+function isWebCompanionAppCheck(request) {
+  const appId = request.app?.appId || request.app?.app_id || "";
+  return appId && getConfiguredWebCompanionAppIds().includes(appId);
+}
+
+function rejectWebCompanionDirectTurn(request) {
+  if (isWebCompanionAppCheck(request)) {
+    throw new HttpsError(
+      "permission-denied",
+      "Web Companion must receive TURN credentials from a premium mobile peer"
+    );
+  }
+}
+
+function validatePairingDocKey(value) {
+  if (typeof value !== "string" || !PAIRING_DOC_KEY_REGEX.test(value)) {
+    throw new HttpsError("invalid-argument", "Invalid pairingDocKey");
+  }
+}
+
+function validateWebField(value, fieldName) {
+  if (typeof value !== "string" || !WEB_ID_REGEX.test(value)) {
+    throw new HttpsError("invalid-argument", `Invalid ${fieldName}`);
+  }
+}
+
+function validateUid(value, fieldName = "uid") {
+  if (typeof value !== "string" || !UID_REGEX.test(value)) {
+    throw new HttpsError("invalid-argument", `Invalid ${fieldName}`);
+  }
+}
+
+function normalizeAllowedRole(value) {
+  const role = String(value || "").trim().toLowerCase();
+  if (!["baby", "parent", "any"].includes(role)) {
+    throw new HttpsError("invalid-argument", "Invalid allowedRole");
+  }
+  return role;
+}
+
+function pairAccessDocId(pairingDocKey, uid) {
+  return `${pairingDocKey}_${uid}`;
+}
+
+async function writePairAccess({
+  pairingDocKey,
+  uid,
+  role,
+  allowedRole = "any",
+  ttlMs,
+  webSessionId = null,
+  webNonce = null,
+  mobileUid = null,
+}) {
+  const db = getFirestore();
+  const expiresAt = new Date(Date.now() + ttlMs);
+  const accessId = pairAccessDocId(pairingDocKey, uid);
+  const body = {
+    pairingDocKey,
+    uid,
+    role,
+    allowedRole,
+    createdAt: FieldValue.serverTimestamp(),
+    authorizedAt: FieldValue.serverTimestamp(),
+    expiresAt,
+  };
+  if (webSessionId) body.webSessionId = webSessionId;
+  if (webNonce) body.webNonce = webNonce;
+  if (mobileUid) body.mobileUid = mobileUid;
+  await db.collection("pair_access").doc(accessId).set(body, { merge: true });
+  return { accessId, expiresAtMillis: expiresAt.getTime() };
 }
 
 function buildCloudflareBuiltinProvider(priority = 2) {
@@ -623,6 +719,7 @@ exports.getTurnCredentials = onCall(
       throw new HttpsError("unauthenticated", "Must be authenticated");
     }
     requireAppCheck(request);
+    rejectWebCompanionDirectTurn(request);
 
     if (!checkRateLimit(rateLimitMap, request.auth.uid, RATE_LIMIT_MAX)) {
       throw new HttpsError("resource-exhausted", "Rate limit exceeded");
@@ -1597,6 +1694,12 @@ function requireAuth(request) {
   }
 }
 
+function validateReceiptData(s) {
+  if (typeof s !== "string" || s.length < 16 || s.length > 200000) {
+    throw new HttpsError("invalid-argument", "Invalid receiptData");
+  }
+}
+
 function randomFromAlphabet(len) {
   const out = [];
   const buf = crypto.randomBytes(len);
@@ -1758,6 +1861,176 @@ function readSubExpiryMillis(sub) {
   }
   return null;
 }
+
+async function verifyAppStoreSubscription(receiptData, subscriptionId) {
+  if (isDebugPurchaseToken(receiptData)) {
+    console.warn("[WEB-AUTH][DEBUG-TOKEN] App Store receipt short-circuit", {
+      subId: subscriptionId,
+      tokenPrefix: receiptData.slice(0, 16),
+    });
+    return { expiryMillis: Date.now() + 30 * 24 * 60 * 60 * 1000, source: "debug" };
+  }
+
+  const password = String(safeParamValue(appStoreSharedSecret) || "").trim();
+  if (!password) {
+    throw new HttpsError(
+      "failed-precondition",
+      "App Store shared secret is not configured"
+    );
+  }
+
+  const body = {
+    "receipt-data": receiptData,
+    password,
+    "exclude-old-transactions": true,
+  };
+  let response = await fetch("https://buy.itunes.apple.com/verifyReceipt", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let json = await response.json();
+  if (json.status === 21007) {
+    response = await fetch("https://sandbox.itunes.apple.com/verifyReceipt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    json = await response.json();
+  }
+  if (json.status !== 0) {
+    throw new HttpsError("failed-precondition", `App Store receipt status ${json.status}`);
+  }
+
+  const latest = Array.isArray(json.latest_receipt_info)
+    ? json.latest_receipt_info
+    : [];
+  const expiryMillis = latest
+    .filter((item) => item.product_id === subscriptionId)
+    .map((item) => Number(item.expires_date_ms || 0))
+    .filter((expiry) => Number.isFinite(expiry))
+    .sort((a, b) => b - a)[0];
+  if (!expiryMillis || expiryMillis < Date.now()) {
+    throw new HttpsError("failed-precondition", "App Store subscription is not active");
+  }
+  return { expiryMillis, source: "app-store" };
+}
+
+async function verifyPremiumProof(proof) {
+  if (!proof || typeof proof !== "object") {
+    throw new HttpsError("invalid-argument", "Premium proof required");
+  }
+  const platform = String(proof.platform || "").trim().toLowerCase();
+  const subscriptionId = proof.subscriptionId || proof.productId || "timmy_support_monthly";
+  validateSubscriptionId(subscriptionId);
+
+  if (platform === "android") {
+    const purchaseToken = proof.purchaseToken;
+    validatePurchaseToken(purchaseToken);
+    const sub = await getPlaySubscription(PACKAGE_NAME, subscriptionId, purchaseToken);
+    const expiryMillis = readSubExpiryMillis(sub);
+    if (!expiryMillis || expiryMillis < Date.now()) {
+      throw new HttpsError("failed-precondition", "Play subscription is not active");
+    }
+    return { expiryMillis, source: isDebugPurchaseToken(purchaseToken) ? "debug" : "play" };
+  }
+
+  if (platform === "ios") {
+    const receiptData = proof.receiptData || proof.purchaseToken;
+    validateReceiptData(receiptData);
+    return verifyAppStoreSubscription(receiptData, subscriptionId);
+  }
+
+  throw new HttpsError("invalid-argument", "Unsupported premium proof platform");
+}
+
+exports.issuePairAccess = onCall(
+  {},
+  async (request) => {
+    requireAppCheck(request);
+    rejectWebCompanionDirectTurn(request);
+    requireAuth(request);
+    if (
+      !checkRateLimit(
+        pairAccessRateLimitMap,
+        request.auth.uid,
+        PAIR_ACCESS_RATE_LIMIT_MAX
+      )
+    ) {
+      throw new HttpsError("resource-exhausted", "Too many pair access requests");
+    }
+
+    const pairingDocKey = request.data?.pairingDocKey;
+    validatePairingDocKey(pairingDocKey);
+
+    const result = await writePairAccess({
+      pairingDocKey,
+      uid: request.auth.uid,
+      role: "mobile",
+      allowedRole: "any",
+      ttlMs: MOBILE_PAIR_ACCESS_TTL_MS,
+    });
+    return { ok: true, role: "mobile", ...result };
+  }
+);
+
+exports.authorizeWebCompanion = onCall(
+  { secrets: [playServiceAccountJson] },
+  async (request) => {
+    requireAppCheck(request);
+    rejectWebCompanionDirectTurn(request);
+    requireAuth(request);
+    if (
+      !checkRateLimit(
+        pairAccessRateLimitMap,
+        `web:${request.auth.uid}`,
+        WEB_ACCESS_RATE_LIMIT_MAX
+      )
+    ) {
+      throw new HttpsError("resource-exhausted", "Too many web authorization requests");
+    }
+
+    const pairingDocKey = request.data?.pairingDocKey;
+    const webUid = request.data?.webUid;
+    const webSessionId = request.data?.webSessionId;
+    const webNonce = request.data?.webNonce;
+    const allowedRole = normalizeAllowedRole(request.data?.allowedRole);
+
+    validatePairingDocKey(pairingDocKey);
+    validateUid(webUid, "webUid");
+    validateWebField(webSessionId, "webSessionId");
+    validateWebField(webNonce, "webNonce");
+
+    const premium = await verifyPremiumProof(request.data?.premiumProof);
+
+    const mobileAccess = await writePairAccess({
+      pairingDocKey,
+      uid: request.auth.uid,
+      role: "mobile",
+      allowedRole: "any",
+      ttlMs: MOBILE_PAIR_ACCESS_TTL_MS,
+    });
+    const webAccess = await writePairAccess({
+      pairingDocKey,
+      uid: webUid,
+      role: "web",
+      allowedRole,
+      ttlMs: WEB_ACCESS_TTL_MS,
+      webSessionId,
+      webNonce,
+      mobileUid: request.auth.uid,
+    });
+
+    return {
+      ok: true,
+      webAccessId: webAccess.accessId,
+      webAccessExpiresAtMillis: webAccess.expiresAtMillis,
+      mobileAccessId: mobileAccess.accessId,
+      premiumSource: premium.source,
+      premiumExpiresAtMillis: premium.expiryMillis,
+    };
+  }
+);
 
 // ─── mintGiftCode ────────────────────────────────────────────────────────────
 

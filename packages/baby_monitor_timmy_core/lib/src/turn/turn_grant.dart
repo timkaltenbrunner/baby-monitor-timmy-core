@@ -37,6 +37,8 @@ class TurnGrant {
     required this.issuedAt,
     required this.expiresAt,
     required this.mobileNonce,
+    this.webNonce,
+    this.accessId,
     this.notBefore,
     this.providerHint,
     this.version = currentVersion,
@@ -65,6 +67,14 @@ class TurnGrant {
   /// in its first signaling message so the mobile can detect replays.
   final String mobileNonce;
 
+  /// Random nonce supplied by the browser when it created the pairing meeting.
+  /// Binding the grant to it prevents a stale grant from a previous tab from
+  /// being accepted by a new browser session with the same pairing key.
+  final String? webNonce;
+
+  /// Backend-issued pair_access document id authorizing the web peer.
+  final String? accessId;
+
   /// Optional provider name hint (`local`, `cloudflare`) for diagnostics.
   final String? providerHint;
 
@@ -85,8 +95,11 @@ class TurnGrant {
         'iceServers': iceServers,
         'issuedAt': issuedAt.toUtc().toIso8601String(),
         'expiresAt': expiresAt.toUtc().toIso8601String(),
-        if (notBefore != null) 'notBefore': notBefore!.toUtc().toIso8601String(),
+        if (notBefore != null)
+          'notBefore': notBefore!.toUtc().toIso8601String(),
         'mobileNonce': mobileNonce,
+        if (webNonce != null) 'webNonce': webNonce,
+        if (accessId != null) 'accessId': accessId,
         if (providerHint != null) 'providerHint': providerHint,
       };
 
@@ -114,6 +127,8 @@ class TurnGrant {
           ? DateTime.parse(json['notBefore'] as String)
           : null,
       mobileNonce: json['mobileNonce'] as String,
+      webNonce: json['webNonce'] as String?,
+      accessId: json['accessId'] as String?,
       providerHint: json['providerHint'] as String?,
       version: version,
     );

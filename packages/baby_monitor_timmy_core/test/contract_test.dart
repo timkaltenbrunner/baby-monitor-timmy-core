@@ -9,5 +9,6 @@ void main() {
     expect(SignalingContract.sessionsCollection, 'sessions');
     expect(SignalingContract.candidatesBabyCollection, 'candidates_baby');
     expect(SignalingContract.candidatesParentCollection, 'candidates_parent');
+    expect(WebAccessContract.pairAccessCollection, 'pair_access');
   });
 }
