@@ -19,6 +19,5 @@ abstract final class PairingContract {
   static const activeStatus = 'active';
   static const endedStatus = 'ended';
   static const resetStatus = 'reset';
-  static const confirmedStatus = 'confirmed';
   static const cancelledStatus = 'cancelled';
 }

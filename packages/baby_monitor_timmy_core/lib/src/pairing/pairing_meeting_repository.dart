@@ -42,7 +42,6 @@ class PairingMeetingData {
     );
   }
 
-  bool get isConfirmed => status == PairingContract.confirmedStatus;
   bool get isCancelled => status == PairingContract.cancelledStatus;
 
   String? remotePublicKeyFor(String uid) {
