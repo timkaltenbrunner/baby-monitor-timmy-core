@@ -65,10 +65,13 @@ test("malformed pairing meeting point writes are rejected", async () => {
 });
 
 test("session documents reject unexpected fields", async () => {
-  const db = testEnv.authenticatedContext("user-1").firestore();
+  const db = testEnv.authenticatedContext("user-1", {
+    clientType: "mobile",
+  }).firestore();
 
   await assertFails(
     setDoc(doc(db, "sessions", "session-1"), {
+      pairingDocKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       status: "waiting",
       createdAt: "now",
       unexpected: true,
@@ -77,14 +80,16 @@ test("session documents reject unexpected fields", async () => {
 });
 
 test("session documents allow the documented signaling fields", async () => {
-  const db = testEnv.authenticatedContext("user-1").firestore();
+  const db = testEnv.authenticatedContext("user-1", {
+    clientType: "mobile",
+  }).firestore();
 
   await assertSucceeds(
     setDoc(doc(db, "sessions", "session-1"), {
       status: "waiting",
       createdAt: "now",
       updatedAt: "later",
-      pairingDocKey: "pairing-doc-key",
+      pairingDocKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       version: 1,
     })
   );

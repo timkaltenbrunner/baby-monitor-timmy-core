@@ -5,6 +5,12 @@ const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const crypto = require("crypto");
+const {
+  DEFAULT_MAX_FUTURE_EXTENSION_DAYS,
+  hasReachedRedemptionLimit,
+  normalizeMaxFutureExtensionDays,
+  wouldExceedFutureExpiryLimit,
+} = require("./lib/referral_helpers");
 
 initializeApp();
 
@@ -1763,6 +1769,7 @@ const SUBSCRIPTION_ID_REGEX = /^[a-z0-9._-]{3,64}$/;
 const PACKAGE_NAME = "com.babymonitortimmy.app";
 const GIFT_DEFER_DAYS = 30;
 const GIFT_CODE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const REFERRAL_CONFIG_DOC = "referral_config";
 
 const giftMintRateLimitMap = new Map();
 const giftRedeemRateLimitMap = new Map();
@@ -1846,6 +1853,25 @@ function validateCampaignSlug(s) {
 
 function sha256Hex(s) {
   return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+async function getReferralConfig(db) {
+  const snap = await db.collection("admin").doc(REFERRAL_CONFIG_DOC).get();
+  const data = snap.exists ? snap.data() : {};
+  return {
+    maxFutureExtensionDays: normalizeMaxFutureExtensionDays(
+      data.maxFutureExtensionDays,
+      DEFAULT_MAX_FUTURE_EXTENSION_DAYS
+    ),
+  };
+}
+
+function extensionLimitError(maxFutureExtensionDays) {
+  return new HttpsError(
+    "failed-precondition",
+    "Extension limit reached",
+    { maxFutureExtensionDays }
+  );
 }
 
 // ─── Play Developer API helpers ─────────────────────────────────────────────
@@ -2350,8 +2376,16 @@ exports.redeemGiftCode = onCall(
       throw new HttpsError("failed-precondition", "Cannot redeem own gift code");
     }
 
+    const referralConfig = await getReferralConfig(db);
+
     // Compute desired new expiry; defer recipient first inside txn-coupled flow.
     const desiredRecipientExpiry = recipientExpiry + GIFT_DEFER_DAYS * 24 * 60 * 60 * 1000;
+    if (wouldExceedFutureExpiryLimit(
+      desiredRecipientExpiry,
+      referralConfig.maxFutureExtensionDays
+    )) {
+      throw extensionLimitError(referralConfig.maxFutureExtensionDays);
+    }
     const playResult = await deferPlaySubscription(
       PACKAGE_NAME,
       subscriptionId,
@@ -2397,14 +2431,23 @@ exports.redeemGiftCode = onCall(
       const sharerExpiry = readSubExpiryMillis(sharerSub);
       if (sharerExpiry && sharerExpiry > Date.now()) {
         const desiredSharerExpiry = sharerExpiry + GIFT_DEFER_DAYS * 24 * 60 * 60 * 1000;
-        await deferPlaySubscription(
-          PACKAGE_NAME,
-          preData.sharerSubscriptionId,
-          preData.sharerPurchaseToken,
-          sharerExpiry,
-          desiredSharerExpiry
-        );
-        await ref.update({ sharerDeferApplied: true });
+        if (wouldExceedFutureExpiryLimit(
+          desiredSharerExpiry,
+          referralConfig.maxFutureExtensionDays
+        )) {
+          console.warn("[Gift] sharer defer skipped: extension limit reached", {
+            maxFutureExtensionDays: referralConfig.maxFutureExtensionDays,
+          });
+        } else {
+          await deferPlaySubscription(
+            PACKAGE_NAME,
+            preData.sharerSubscriptionId,
+            preData.sharerPurchaseToken,
+            sharerExpiry,
+            desiredSharerExpiry
+          );
+          await ref.update({ sharerDeferApplied: true });
+        }
       } else {
         console.warn("[Gift] sharer sub no longer active; skipping sharer defer");
       }
@@ -2478,17 +2521,6 @@ exports.redeemCampaignCode = onCall(
       throw new HttpsError("not-found", "Campaign code not found");
     }
     const c = campaignSnap.data();
-    if (!c.active) {
-      throw new HttpsError("failed-precondition", "Campaign inactive");
-    }
-    if (c.expiresAt && c.expiresAt.toDate && c.expiresAt.toDate() < new Date()) {
-      throw new HttpsError("deadline-exceeded", "Campaign expired");
-    }
-    if (c.maxRedemptions && (c.redemptionCount || 0) >= c.maxRedemptions) {
-      throw new HttpsError("resource-exhausted", "Campaign limit reached");
-    }
-    const deferDays = c.deferDays > 0 ? c.deferDays : 30;
-
     const tokenHash = sha256Hex(purchaseToken);
     const redeemId = `${slug}_${tokenHash}`;
     const redeemRef = db.collection("campaign_redemptions").doc(redeemId);
@@ -2497,10 +2529,21 @@ exports.redeemCampaignCode = onCall(
       return {
         ok: true,
         idempotent: true,
-        deferDays,
+        deferDays: c.deferDays > 0 ? c.deferDays : 30,
         newExpiryMillis: existing.data().newExpiryMillis ?? null,
       };
     }
+    if (!c.active) {
+      throw new HttpsError("failed-precondition", "Campaign inactive");
+    }
+    if (c.expiresAt && c.expiresAt.toDate && c.expiresAt.toDate() < new Date()) {
+      throw new HttpsError("deadline-exceeded", "Campaign expired");
+    }
+    if (hasReachedRedemptionLimit(c.maxRedemptions, c.redemptionCount)) {
+      throw new HttpsError("resource-exhausted", "Campaign limit reached");
+    }
+    const deferDays = c.deferDays > 0 ? c.deferDays : 30;
+    const referralConfig = await getReferralConfig(db);
 
     // Verify the recipient sub is active.
     const sub = await getPlaySubscription(PACKAGE_NAME, subscriptionId, purchaseToken);
@@ -2509,6 +2552,12 @@ exports.redeemCampaignCode = onCall(
       throw new HttpsError("failed-precondition", "Subscription not active");
     }
     const desired = expiry + deferDays * 24 * 60 * 60 * 1000;
+    if (wouldExceedFutureExpiryLimit(
+      desired,
+      referralConfig.maxFutureExtensionDays
+    )) {
+      throw extensionLimitError(referralConfig.maxFutureExtensionDays);
+    }
 
     // Reserve idempotency record before defer.
     const testRunId = pickTestRunId(request, purchaseToken);
@@ -2543,7 +2592,11 @@ exports.redeemCampaignCode = onCall(
       : desired;
 
     await redeemRef.update({ deferApplied: true, newExpiryMillis });
-    await campaignRef.update({ redemptionCount: FieldValue.increment(1) });
+    await campaignRef.update({
+      redemptionCount: FieldValue.increment(1),
+      lastRedeemedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
 
     return { ok: true, deferDays, newExpiryMillis };
   }

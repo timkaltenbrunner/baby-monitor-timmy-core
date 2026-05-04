@@ -10,10 +10,9 @@ only partially met:
 
 1. **Viral growth via user-to-user gifting** — a subscribed user can send a
    friend a code that gives both of them an extra free month.
-2. **Paid-ad attribution & higher conversion** — every paid-ad campaign has
-   its own auto-redeemed deep link, so ad-driven installs start with 60 days
-   free instead of 30. We can measure conversions per campaign without any
-   third-party tracker.
+2. **Reusable promo campaigns** — every campaign code can be distributed via
+   paid-ad deep links or shared manually in the app. We can measure aggregate
+   conversions per campaign without any third-party tracker.
 3. **Zero persistent per-device server records** — Play Store is the system
    of record for entitlement. No `installId`, no persistent `entitlements`
    doc, no account-hash table.
@@ -44,15 +43,20 @@ Replays are no-ops.
 - `gift_codes/{nonce}` — single-use, minted by a subscribed user for a
   friend. Dual-credit: both sharer and recipient get +30 days.
 - `campaign_codes/{slug}` — multi-use, admin-created, distributed via paid
-  ads. Single-credit: only the recipient gets +30 days.
+  ads, tester cohorts, or any future promo program. Single-credit: only the
+  recipient gets `deferDays`.
 
-### 2.4 Campaign codes via Play Install Referrer
+### 2.4 Campaign codes via Play Install Referrer or manual entry
 
 Ad deep links:
 `https://play.google.com/store/apps/details?id=com.babymonitortimmy.app&referrer=camp_<slug>`.
 On first launch the app reads the referrer once via the official
 `com.android.installreferrer` API, extracts the slug, and stashes it for
 auto-redemption when the user subscribes.
+
+The same campaign code can also be entered manually in the shared redeem
+dialog. Both paths end at the same `redeemCampaignCode` backend callable and
+therefore share the same quota, idempotency, and validation rules.
 
 ### 2.5 HMAC-signed gift codes
 
@@ -67,14 +71,21 @@ nonce lookup.
 Campaign codes use plain slugs — they're published in ads. Abuse bounded by
 `maxRedemptions` and one-redemption-per-purchase-token.
 
-### 2.6 Duplicate-defer prevention
+### 2.6 Configurable future-extension cap
+
+Gift and campaign redemptions may stack, but the backend rejects any defer that
+would move the resulting Play expiry beyond a configurable global limit. The
+current source of truth is `admin/referral_config.maxFutureExtensionDays`
+(default `600`).
+
+### 2.7 Duplicate-defer prevention
 
 Every `gift_codes/{nonce}` and `campaign_redemptions/{id}` write flips a
 `deferApplied` flag inside a Firestore transaction before calling Play. On
 Play failure the flag is rolled back. Combined with Play's idempotent
 absolute-expiry semantics, this gives two independent layers of safety.
 
-### 2.7 Pricing: €1 / CHF 1
+### 2.8 Pricing: EUR 1 / CHF 1
 
 Strategically low so the subscription is effectively a tip. Gift loop is
 goodwill. Campaign 60-day path costs ~€0.85/conversion.
@@ -125,10 +136,13 @@ first open ──redeemCampaignCode──▶ Cloud Function ──defer──▶
   expiresAt: Timestamp | null,
   maxRedemptions: number | null,
   redemptionCount: number,
+  lastRedeemedAt: Timestamp | null,
   deferDays: number,
   active: boolean,
   label: string,
   createdBy: string,
+  updatedAt: Timestamp | null,
+  updatedBy: string | null,
 }
 ```
 
@@ -144,9 +158,23 @@ first open ──redeemCampaignCode──▶ Cloud Function ──defer──▶
 }
 ```
 
-### 4.4 Firestore rules
+### 4.4 `admin/referral_config`
+
+```ts
+{
+  maxFutureExtensionDays: number,   // default 600
+  updatedAt: Timestamp | null,
+  updatedBy: string | null,
+}
+```
+
+### 4.5 Firestore rules
 
 ```
+match /admin/{document=**} {
+  allow read: if request.auth != null;
+  allow write: if isAdmin();
+}
 match /gift_codes/{nonce} {
   allow read: if request.auth != null;
   allow write: if false;     // Admin SDK only
@@ -183,7 +211,8 @@ const playServiceAccountJson = defineSecret("PLAY_DEVELOPER_SERVICE_ACCOUNT_JSON
   60/hour.
 - `redeemCampaignCode({slug, purchaseToken, subscriptionId})` — single
   redemption per purchase token. Returns `{ok, newExpiryMillis, deferDays}`.
-  3/hour.
+  Rejects inactive, expired, quota-exhausted, or future-cap-exceeding promo
+  codes. 3/hour.
 
 ### 5.3 Cleanup
 
@@ -191,7 +220,9 @@ const playServiceAccountJson = defineSecret("PLAY_DEVELOPER_SERVICE_ACCOUNT_JSON
 - `gift_codes/{nonce}` once `expiresAt < now`.
 - `campaign_redemptions/{id}` 90 days after `redeemedAt`.
 
-`campaign_codes/{slug}` is admin-curated, never auto-deleted.
+`campaign_codes/{slug}` is admin-curated, never auto-deleted. Aggregate stats
+for admin reporting live on this document, not on the cleaned-up redemption
+ledger.
 
 ### 5.4 Removed
 
@@ -226,9 +257,10 @@ Kept: `keyNagLastShown`.
 
 - `gift_month_sheet.dart` — three states (not-subscribed / loading /
   success-with-code).
-- `redeem_gift_sheet.dart` — dash-formatted code input, validates HMAC
-  client-side.
-- `parent_settings_sheet.dart` — "Gift a free month" + "Redeem gift code"
+- `redeem_gift_sheet.dart` — shared gift/promo code input. Gift codes still
+  get local format validation; promo slugs are normalized and sent to the
+  backend.
+- `parent_settings_sheet.dart` — "Gift a free month" + "Redeem code"
   tiles.
 
 ## 7. Android native
@@ -275,7 +307,8 @@ Restored `com.babymonitortimmy.app/install_referrer` MethodChannel.
 
 ## 9. Out of scope (Phase 2)
 
-- Admin UI for `campaign_codes/{slug}` (edit Firestore directly for v1).
+- German admin UI for `campaign_codes/{slug}` plus
+  `admin/referral_config.maxFutureExtensionDays`.
 - Play Integrity attestation on mint + redeem (TODO in code).
 - iOS port.
 - Sharer-defer reconciliation job.

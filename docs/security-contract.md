@@ -101,6 +101,7 @@ Typical fields:
 - `gift_codes/{nonce}`
 - `campaign_codes/{slug}`
 - `campaign_redemptions/{id}`
+- `admin/referral_config`
 
 ## Callable Cloud Functions used by the app
 
@@ -172,6 +173,7 @@ Returns remotely managed restriction flags and admin banners.
 - `sessions`, candidates, and `pairings`: allowed for mobile clients with
   `clientType == "mobile"` or web clients with an active lease matching the
   requested `pairingDocKey`.
+- `admin/**`: readable for signed-in clients, writable only for admins.
 - `web_client_sessions`: readable only by the matching browser UID.
 - `web_client_mobiles`: backend-only.
 
