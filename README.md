@@ -65,7 +65,14 @@ Firestore rules tests need the Firestore emulator and Java:
 
 ```bash
 cd functions
-npx firebase emulators:exec --project demo-timmy-core "npm run test:rules"
+npx firebase emulators:exec --only firestore --project demo-timmy-core "npm run test:rules"
+```
+
+This repository owns the canonical production Firestore rules. Deploy rules from
+the core repository root:
+
+```bash
+firebase deploy --only firestore:rules --project baby-monitor-timmy
 ```
 
 More detail is available in [`docs/verification.md`](docs/verification.md).

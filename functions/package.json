@@ -9,6 +9,7 @@
     "lint": "node --check index.js && node --check lib/public_helpers.js && node --check lib/referral_helpers.js",
     "test:unit": "node --test test/public_helpers.test.js test/referral_helpers.test.js",
     "test:rules": "node --test test/firestore.rules.test.js",
+    "deploy:rules": "cd .. && firebase deploy --only firestore:rules --project baby-monitor-timmy",
     "test": "npm run test:unit"
   },
   "dependencies": {

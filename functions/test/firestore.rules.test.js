@@ -16,6 +16,9 @@ const {
 
 const PROJECT_ID = "demo-timmy-core";
 const ADMIN_UID = "DcyIopcaDjUCcHbUhx0VHYM8hZ33";
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
+const RULES_PATH = path.join(REPO_ROOT, "firestore.rules");
+const FIREBASE_CONFIG_PATH = path.join(REPO_ROOT, "firebase.json");
 
 let testEnv;
 
@@ -23,10 +26,7 @@ test.before(async () => {
   testEnv = await initializeTestEnvironment({
     projectId: PROJECT_ID,
     firestore: {
-      rules: fs.readFileSync(
-        path.resolve(__dirname, "..", "..", "firestore.rules"),
-        "utf8"
-      ),
+      rules: fs.readFileSync(RULES_PATH, "utf8"),
     },
   });
 });
@@ -37,6 +37,14 @@ test.after(async () => {
 
 test.afterEach(async () => {
   await testEnv.clearFirestore();
+});
+
+test("Firebase config deploys the canonical Firestore rules file", () => {
+  const firebaseConfig = JSON.parse(
+    fs.readFileSync(FIREBASE_CONFIG_PATH, "utf8")
+  );
+
+  assert.equal(firebaseConfig.firestore.rules, "firestore.rules");
 });
 
 test("authenticated clients can create a valid pairing meeting point", async () => {

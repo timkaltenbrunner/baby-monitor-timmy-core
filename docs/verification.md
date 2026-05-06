@@ -31,7 +31,16 @@ npm run test:unit
 
 ```bash
 cd functions
-npx firebase emulators:exec --project demo-timmy-core "npm run test:rules"
+npx firebase emulators:exec --only firestore --project demo-timmy-core "npm run test:rules"
+```
+
+## Deploy Firestore rules
+
+`firestore.rules` in the core repository root is the canonical production rules
+file. Deploy it from this repository, not from the private app repo:
+
+```bash
+firebase deploy --only firestore:rules --project baby-monitor-timmy
 ```
 
 ## What each check covers
@@ -50,3 +59,4 @@ npx firebase emulators:exec --project demo-timmy-core "npm run test:rules"
   - authenticated vs unauthenticated access
   - schema validation for public collections
   - admin-only write behaviour
+  - Firebase deploy config points at the canonical root `firestore.rules`
