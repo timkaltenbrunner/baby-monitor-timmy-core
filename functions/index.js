@@ -11,6 +11,12 @@ const {
   normalizeMaxFutureExtensionDays,
   wouldExceedFutureExpiryLimit,
 } = require("./lib/referral_helpers");
+const {
+  ACTIVE_SESSION_STATUSES: ADMIN_ACTIVE_SESSION_STATUSES,
+  sanitizeAdminSessionDoc,
+  summarizeAdminSessions,
+} = require("./lib/admin_sessions_helpers");
+const { shouldDeleteCleanupDoc } = require("./lib/cleanup_helpers");
 
 initializeApp();
 
@@ -1133,6 +1139,51 @@ exports.setTurnConfigAdmin = onCall(
   }
 );
 
+// ─── listAdminSessions (admin only) ───────────────────────────────────────────
+//
+// Sanitized session metadata for the admin dashboard. This intentionally does
+// not return SDP, ICE candidates, raw UIDs, or pairing keys.
+
+function parseAdminSessionLimit(rawValue, fallback = 50) {
+  const parsed = Number.parseInt(String(rawValue ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, 500);
+}
+
+exports.listAdminSessions = onCall({}, async (request) => {
+  requireAdmin(request);
+  requireAppCheck(request);
+
+  const db = getFirestore();
+  const limit = parseAdminSessionLimit(request.data?.limit);
+  const activeOnly = request.data?.activeOnly === true;
+  const includeSessions = request.data?.includeSessions !== false;
+
+  let query = db.collection("sessions");
+  if (activeOnly) {
+    query = query.where(
+      "status",
+      "in",
+      Array.from(ADMIN_ACTIVE_SESSION_STATUSES)
+    );
+  } else {
+    query = query.orderBy("createdAt", "desc");
+  }
+
+  const snap = await query.limit(limit).get();
+  const sessions = snap.docs.map((doc) =>
+    sanitizeAdminSessionDoc(doc.id, doc.data() || {})
+  );
+
+  return {
+    sessions: includeSessions ? sessions : [],
+    summary: summarizeAdminSessions(sessions),
+    limit,
+    truncated: snap.size >= limit,
+    generatedAt: new Date().toISOString(),
+  };
+});
+
 // ─── getAppConfig ────────────────────────────────────────────────────────────
 
 exports.getAppConfig = onCall(
@@ -1475,14 +1526,13 @@ exports.cacheTurnUsage = onSchedule(
  * - Pairing_codes (ECDH meeting points): kept up to 24 hours.
  * - Pairings: kept up to 24 hours; ended pairings older than 1 hour are
  *   removed earlier to allow re-pairing.
+ * - Campaign_redemptions: retained as a permanent hash/idempotency ledger.
  */
 exports.cleanupStaleSessions = onSchedule(
   { schedule: "every 30 minutes", timeoutSeconds: 300 },
   async () => {
     const db = getFirestore();
     const now = new Date();
-    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
     let deletedSessions = 0;
     let deletedPairingCodes = 0;
@@ -1491,10 +1541,7 @@ exports.cleanupStaleSessions = onSchedule(
     // 1. Delete sessions older than 24 hours (any status).
     const sessionsSnap = await db.collection("sessions").get();
     for (const doc of sessionsSnap.docs) {
-      const data = doc.data();
-      const createdAt = data.createdAt?.toDate?.();
-
-      if (createdAt && createdAt < oneDayAgo) {
+      if (shouldDeleteCleanupDoc("sessions", doc.data(), now)) {
         await deleteSubcollection(db, `sessions/${doc.id}/candidates_baby`);
         await deleteSubcollection(db, `sessions/${doc.id}/candidates_parent`);
         await doc.ref.delete();
@@ -1505,10 +1552,7 @@ exports.cleanupStaleSessions = onSchedule(
     // 2. Delete pairing codes older than 24 hours.
     const pairingSnap = await db.collection("pairing_codes").get();
     for (const doc of pairingSnap.docs) {
-      const data = doc.data();
-      const createdAt = data.createdAt?.toDate?.();
-
-      if (createdAt && createdAt < oneDayAgo) {
+      if (shouldDeleteCleanupDoc("pairing_codes", doc.data(), now)) {
         await doc.ref.delete();
         deletedPairingCodes++;
       }
@@ -1517,16 +1561,7 @@ exports.cleanupStaleSessions = onSchedule(
     // 3. Delete stale pairings (ended > 1 hour OR any > 24 hours)
     const pairingsSnap = await db.collection("pairings").get();
     for (const doc of pairingsSnap.docs) {
-      const data = doc.data();
-      const createdAt = data.createdAt?.toDate?.();
-      const updatedAt = data.updatedAt?.toDate?.();
-      const status = data.status;
-
-      const isEndedAndStale =
-        status === "ended" && updatedAt && updatedAt < oneHourAgo;
-      const isVeryOld = createdAt && createdAt < oneDayAgo;
-
-      if (isEndedAndStale || isVeryOld) {
+      if (shouldDeleteCleanupDoc("pairings", doc.data(), now)) {
         await doc.ref.delete();
         deletedPairings++;
       }
@@ -1536,29 +1571,14 @@ exports.cleanupStaleSessions = onSchedule(
     let deletedGiftCodes = 0;
     const giftSnap = await db.collection("gift_codes").get();
     for (const doc of giftSnap.docs) {
-      const data = doc.data();
-      const expiresAt = data.expiresAt?.toDate?.();
-      if (expiresAt && expiresAt < now) {
+      if (shouldDeleteCleanupDoc("gift_codes", doc.data(), now)) {
         await doc.ref.delete();
         deletedGiftCodes++;
       }
     }
 
-    // 5. Delete campaign_redemptions older than 90 days.
-    let deletedCampaignRedemptions = 0;
-    const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-    const redempSnap = await db.collection("campaign_redemptions").get();
-    for (const doc of redempSnap.docs) {
-      const data = doc.data();
-      const redeemedAt = data.redeemedAt?.toDate?.();
-      if (redeemedAt && redeemedAt < ninetyDaysAgo) {
-        await doc.ref.delete();
-        deletedCampaignRedemptions++;
-      }
-    }
-
     console.log(
-      `Cleanup: ${deletedSessions} sessions, ${deletedPairingCodes} pairing codes, ${deletedPairings} pairings, ${deletedGiftCodes} gift codes, ${deletedCampaignRedemptions} campaign redemptions deleted`
+      `Cleanup: ${deletedSessions} sessions, ${deletedPairingCodes} pairing codes, ${deletedPairings} pairings, ${deletedGiftCodes} gift codes deleted`
     );
   }
 );

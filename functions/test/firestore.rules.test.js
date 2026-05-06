@@ -103,6 +103,20 @@ test("session documents allow the documented signaling fields", async () => {
   );
 });
 
+test("admin dashboard cannot read raw session documents directly", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    await setDoc(doc(context.firestore(), "sessions", "session-1"), {
+      status: "connected",
+      createdAt: "now",
+      pairingDocKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      offerSdp: "encrypted-offer",
+    });
+  });
+
+  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
+  await assertFails(getDoc(doc(adminDb, "sessions", "session-1")));
+});
+
 test("unauthenticated users cannot read protected collections", async () => {
   const db = testEnv.unauthenticatedContext().firestore();
 
