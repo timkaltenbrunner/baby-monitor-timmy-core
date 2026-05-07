@@ -70,6 +70,21 @@ class PairingMeetingRepository {
     String? peerType,
     String? webSessionId,
   }) {
+    final data = createMeetingPointData(
+      uid: uid,
+      publicKey: publicKey,
+      peerType: peerType,
+      webSessionId: webSessionId,
+    );
+    return meetingRef(meetingKey).set(data);
+  }
+
+  static Map<String, dynamic> createMeetingPointData({
+    required String uid,
+    required String publicKey,
+    String? peerType,
+    String? webSessionId,
+  }) {
     final data = <String, dynamic>{
       PairingContract.createdAtField: FieldValue.serverTimestamp(),
       PairingContract.pubkeysField: {uid: publicKey},
@@ -81,7 +96,7 @@ class PairingMeetingRepository {
       data[PairingContract.webUidField] = uid;
       data[PairingContract.webSessionIdField] = webSessionId;
     }
-    return meetingRef(meetingKey).set(data, SetOptions(merge: true));
+    return data;
   }
 
   Stream<PairingMeetingData> watchMeetingPoint(String meetingKey) {
