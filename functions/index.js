@@ -29,7 +29,15 @@ const adminUid = defineString("ADMIN_UID");
 const localTurnApiBaseUrl = defineString("LOCAL_TURN_API_BASE_URL");
 const localTurnPublicUrls = defineString("LOCAL_TURN_PUBLIC_URLS");
 const webCompanionAppIds = defineString("WEB_COMPANION_APP_IDS");
+const iosMobileAppIds = defineString("IOS_MOBILE_APP_IDS");
+const iosTestHarnessRecordingAllowed = defineString(
+  "IOS_TEST_HARNESS_RECORDING_ALLOWED"
+);
 const appStoreSharedSecret = defineString("APP_STORE_SHARED_SECRET");
+const appStoreServerKeyId = defineSecret("APP_STORE_SERVER_KEY_ID");
+const appStoreServerIssuerId = defineSecret("APP_STORE_SERVER_ISSUER_ID");
+const appStoreServerPrivateKey = defineSecret("APP_STORE_SERVER_PRIVATE_KEY");
+const appStoreBundleId = defineString("APP_STORE_BUNDLE_ID");
 const localTurnApiKey = defineSecret("LOCAL_TURN_API_KEY");
 const localTurnHmacSecret = defineSecret("LOCAL_TURN_HMAC_SECRET");
 
@@ -106,6 +114,9 @@ const clientAuthRateLimitMap = new Map();
 const MOBILE_AUTH_RATE_LIMIT_MAX = 30;
 const WEB_ACCESS_RATE_LIMIT_MAX = 20;
 
+const entitlementRateLimitMap = new Map();
+const ENTITLEMENT_RATE_LIMIT_MAX = 120;
+
 const WEB_COMPANION_DEFAULT_APP_IDS = [
   "1:335595248113:web:a1e763f1862f4847214c50",
 ];
@@ -158,6 +169,18 @@ function getConfiguredWebCompanionAppIds() {
 function isWebCompanionAppCheck(request) {
   const appId = request.app?.appId || request.app?.app_id || "";
   return appId && getConfiguredWebCompanionAppIds().includes(appId);
+}
+
+function getConfiguredIosMobileAppIds() {
+  return String(safeParamValue(iosMobileAppIds) || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
+function isIosMobileAppCheck(request) {
+  const appId = request.app?.appId || request.app?.app_id || "";
+  return appId && getConfiguredIosMobileAppIds().includes(appId);
 }
 
 function validatePairingDocKey(value) {
@@ -2024,6 +2047,210 @@ function readSubExpiryMillis(sub) {
   return null;
 }
 
+function base64Url(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function readDerLength(buffer, offset) {
+  const first = buffer[offset];
+  if (first < 0x80) return { length: first, offset: offset + 1 };
+  const bytes = first & 0x7f;
+  let length = 0;
+  for (let i = 0; i < bytes; i++) {
+    length = (length << 8) | buffer[offset + 1 + i];
+  }
+  return { length, offset: offset + 1 + bytes };
+}
+
+function readDerInteger(buffer, offset) {
+  if (buffer[offset] !== 0x02) {
+    throw new Error("Invalid ECDSA DER signature");
+  }
+  const lengthInfo = readDerLength(buffer, offset + 1);
+  const start = lengthInfo.offset;
+  const end = start + lengthInfo.length;
+  let value = buffer.subarray(start, end);
+  while (value.length > 0 && value[0] === 0x00) {
+    value = value.subarray(1);
+  }
+  if (value.length > 32) {
+    throw new Error("Invalid ECDSA DER signature");
+  }
+  return {
+    value: Buffer.concat([Buffer.alloc(32 - value.length), value]),
+    offset: end,
+  };
+}
+
+function derToJoseSignature(derSignature) {
+  const buffer = Buffer.from(derSignature);
+  if (buffer[0] !== 0x30) {
+    throw new Error("Invalid ECDSA DER signature");
+  }
+  const sequence = readDerLength(buffer, 1);
+  const r = readDerInteger(buffer, sequence.offset);
+  const s = readDerInteger(buffer, r.offset);
+  return Buffer.concat([r.value, s.value]);
+}
+
+function normalizePrivateKey(value) {
+  return String(value || "").replace(/\\n/g, "\n").trim();
+}
+
+function getAppStoreServerAuthConfig() {
+  const keyId = String(safeParamValue(appStoreServerKeyId) || "").trim();
+  const issuerId = String(safeParamValue(appStoreServerIssuerId) || "").trim();
+  const privateKey = normalizePrivateKey(safeParamValue(appStoreServerPrivateKey));
+  const bundleId = String(safeParamValue(appStoreBundleId) || "com.babymonitortimmy.app").trim();
+  const configured = Boolean(keyId || issuerId || privateKey);
+  if (!configured) return null;
+  if (!keyId || !issuerId || !privateKey || !bundleId) {
+    throw new HttpsError("failed-precondition", "App Store Server API auth is partially configured");
+  }
+  return { keyId, issuerId, privateKey, bundleId };
+}
+
+function createAppStoreServerJwt(config) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "ES256", kid: config.keyId, typ: "JWT" };
+  const payload = {
+    iss: config.issuerId,
+    iat: now - 30,
+    exp: now + 20 * 60,
+    aud: "appstoreconnect-v1",
+    bid: config.bundleId,
+  };
+  const signingInput = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
+  const derSignature = crypto.sign("sha256", Buffer.from(signingInput), config.privateKey);
+  return `${signingInput}.${base64Url(derToJoseSignature(derSignature))}`;
+}
+
+async function fetchAppStoreSubscriptionStatuses(originalTransactionId, environment) {
+  const config = getAppStoreServerAuthConfig();
+  if (!config || !originalTransactionId) return null;
+  const host = environment === "Sandbox"
+    ? "https://api.storekit-sandbox.itunes.apple.com"
+    : "https://api.storekit.itunes.apple.com";
+  const response = await fetch(
+    `${host}/inApps/v1/subscriptions/${encodeURIComponent(originalTransactionId)}?status=1&status=4`,
+    {
+      headers: {
+        Authorization: `Bearer ${createAppStoreServerJwt(config)}`,
+      },
+    }
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new HttpsError(
+      "failed-precondition",
+      `App Store Server API subscription lookup failed: ${response.status} ${text}`
+    );
+  }
+  return response.json();
+}
+
+function isJwsCompact(value) {
+  return typeof value === "string" && value.split(".").length === 3;
+}
+
+function decodeJwsPayload(value) {
+  if (!isJwsCompact(value)) {
+    throw new HttpsError("invalid-argument", "Invalid signedTransactionInfo");
+  }
+  const [, payload] = value.split(".");
+  const normalized = payload
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(payload.length / 4) * 4, "=");
+  try {
+    return JSON.parse(Buffer.from(normalized, "base64").toString("utf8"));
+  } catch (error) {
+    throw new HttpsError(
+      "invalid-argument",
+      `Invalid signedTransactionInfo payload: ${error.message}`
+    );
+  }
+}
+
+async function fetchAppStoreSubscriptionStatusesWithFallback(anyTransactionId, hintedEnvironment) {
+  const preferred = hintedEnvironment === "Sandbox"
+    ? ["Sandbox", "Production"]
+    : hintedEnvironment === "Production"
+      ? ["Production", "Sandbox"]
+      : ["Production", "Sandbox"];
+  let lastError = null;
+  for (const environment of preferred) {
+    try {
+      return await fetchAppStoreSubscriptionStatuses(anyTransactionId, environment);
+    } catch (error) {
+      lastError = error;
+      if (!String(error?.message || "").includes("404")) {
+        throw error;
+      }
+    }
+  }
+  if (lastError) throw lastError;
+  return null;
+}
+
+function collectAppStoreLastTransactions(statusResponse) {
+  if (!statusResponse || !Array.isArray(statusResponse.data)) {
+    return [];
+  }
+  return statusResponse.data.flatMap((group) =>
+    Array.isArray(group.lastTransactions) ? group.lastTransactions : []
+  );
+}
+
+function readExpiresDateMillisFromSignedTransaction(signedTransactionInfo) {
+  const payload = decodeJwsPayload(signedTransactionInfo);
+  const expiryMillis = Number(payload.expiresDate || 0);
+  return Number.isFinite(expiryMillis) ? expiryMillis : 0;
+}
+
+async function verifyAppStoreSignedTransaction(signedTransactionInfo, subscriptionId) {
+  const payload = decodeJwsPayload(signedTransactionInfo);
+  if (payload.productId && payload.productId !== subscriptionId) {
+    throw new HttpsError("failed-precondition", "App Store transaction is for a different product");
+  }
+  const anyTransactionId = String(
+    payload.transactionId || payload.originalTransactionId || ""
+  ).trim();
+  if (!anyTransactionId) {
+    throw new HttpsError("invalid-argument", "signedTransactionInfo is missing transaction identifiers");
+  }
+
+  const statusResponse = await fetchAppStoreSubscriptionStatusesWithFallback(
+    anyTransactionId,
+    payload.environment
+  );
+  const matchingTransactions = collectAppStoreLastTransactions(statusResponse)
+    .map((transaction) => ({
+      status: Number(transaction.status || 0),
+      payload: decodeJwsPayload(transaction.signedTransactionInfo),
+    }))
+    .filter(({payload}) => payload.productId === subscriptionId)
+    .sort((a, b) => Number(b.payload.expiresDate || 0) - Number(a.payload.expiresDate || 0));
+
+  const active = matchingTransactions.find(({status, payload}) => {
+    const expiryMillis = Number(payload.expiresDate || 0);
+    return (status === 1 || status === 4) && Number.isFinite(expiryMillis) && expiryMillis > Date.now();
+  });
+
+  if (!active) {
+    throw new HttpsError("failed-precondition", "App Store signed transaction is not active");
+  }
+
+  return {
+    expiryMillis: Number(active.payload.expiresDate),
+    source: "app-store-server-api-jws",
+  };
+}
+
 async function verifyAppStoreSubscription(receiptData, subscriptionId) {
   if (isDebugPurchaseToken(receiptData)) {
     console.warn("[WEB-AUTH][DEBUG-TOKEN] App Store receipt short-circuit", {
@@ -2075,7 +2302,26 @@ async function verifyAppStoreSubscription(receiptData, subscriptionId) {
   if (!expiryMillis || expiryMillis < Date.now()) {
     throw new HttpsError("failed-precondition", "App Store subscription is not active");
   }
-  return { expiryMillis, source: "app-store" };
+
+  const latestForProduct = latest
+    .filter((item) => item.product_id === subscriptionId)
+    .sort((a, b) => Number(b.expires_date_ms || 0) - Number(a.expires_date_ms || 0))[0];
+  const originalTransactionId = latestForProduct?.original_transaction_id;
+  let serverApiStatus = null;
+  try {
+    serverApiStatus = await fetchAppStoreSubscriptionStatuses(
+      originalTransactionId,
+      json.environment
+    );
+  } catch (e) {
+    console.warn("[AppStore] Server API status lookup failed after receipt verification", {
+      message: e.message,
+    });
+  }
+  return {
+    expiryMillis,
+    source: serverApiStatus ? "app-store-server-api" : "app-store",
+  };
 }
 
 async function verifyPremiumProof(proof) {
@@ -2098,6 +2344,10 @@ async function verifyPremiumProof(proof) {
   }
 
   if (platform === "ios") {
+    const signedTransactionInfo = proof.signedTransactionInfo;
+    if (typeof signedTransactionInfo === "string" && signedTransactionInfo.trim()) {
+      return verifyAppStoreSignedTransaction(signedTransactionInfo.trim(), subscriptionId);
+    }
     const receiptData = proof.receiptData || proof.purchaseToken;
     validateReceiptData(receiptData);
     return verifyAppStoreSubscription(receiptData, subscriptionId);
@@ -2205,8 +2455,47 @@ exports.registerMobileClient = onCall(
   }
 );
 
+exports.verifySubscriptionEntitlement = onCall(
+  {
+    secrets: [
+      playServiceAccountJson,
+      appStoreServerKeyId,
+      appStoreServerIssuerId,
+      appStoreServerPrivateKey,
+    ],
+  },
+  async (request) => {
+    requireAppCheck(request);
+    requireMobileClient(request);
+    if (
+      !checkRateLimit(
+        entitlementRateLimitMap,
+        `entitlement:${request.auth.uid}`,
+        ENTITLEMENT_RATE_LIMIT_MAX
+      )
+    ) {
+      throw new HttpsError("resource-exhausted", "Too many entitlement verification requests");
+    }
+
+    const premium = await verifyPremiumProof(request.data?.premiumProof);
+    return {
+      ok: true,
+      active: true,
+      premiumSource: premium.source,
+      premiumExpiresAtMillis: premium.expiryMillis,
+    };
+  }
+);
+
 exports.authorizeWebClient = onCall(
-  { secrets: [playServiceAccountJson] },
+  {
+    secrets: [
+      playServiceAccountJson,
+      appStoreServerKeyId,
+      appStoreServerIssuerId,
+      appStoreServerPrivateKey,
+    ],
+  },
   async (request) => {
     requireAppCheck(request);
     requireMobileClient(request);
@@ -2244,6 +2533,43 @@ exports.authorizeWebClient = onCall(
       premiumExpiresAtMillis: premium.expiryMillis,
       ...session,
     };
+  }
+);
+
+exports.recordIosGameLoopDiagnostics = onCall(
+  {},
+  async (request) => {
+    requireAppCheck(request);
+    if (
+      safeParamValue(iosTestHarnessRecordingAllowed) !== "true" ||
+      !isIosMobileAppCheck(request)
+    ) {
+      throw new HttpsError("permission-denied", "iOS Test Lab diagnostics are not allowed");
+    }
+
+    const scenario = String(request.data?.scenario || "").trim();
+    if (!TEST_RUN_ID_REGEX.test(scenario)) {
+      throw new HttpsError("invalid-argument", "Invalid scenario");
+    }
+    const diagnostics = request.data?.diagnostics;
+    if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) {
+      throw new HttpsError("invalid-argument", "Diagnostics object required");
+    }
+    const encoded = JSON.stringify(diagnostics);
+    if (encoded.length > 30000) {
+      throw new HttpsError("invalid-argument", "Diagnostics payload too large");
+    }
+
+    const now = FieldValue.serverTimestamp();
+    await getFirestore().collection("ios_game_loop_diagnostics").doc(scenario).set({
+      scenario,
+      uid: request.auth?.uid || null,
+      appId: request.app?.appId || request.app?.app_id || "",
+      diagnostics,
+      updatedAt: now,
+      createdAt: now,
+    }, { merge: true });
+    return { ok: true, scenario };
   }
 );
 
