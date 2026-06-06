@@ -13,6 +13,7 @@ const {
 } = require("./lib/referral_helpers");
 const {
   ACTIVE_SESSION_STATUSES: ADMIN_ACTIVE_SESSION_STATUSES,
+  groupAdminSessions,
   sanitizeAdminSessionDoc,
   summarizeAdminSessions,
 } = require("./lib/admin_sessions_helpers");
@@ -1150,6 +1151,11 @@ function parseAdminSessionLimit(rawValue, fallback = 50) {
   return Math.min(parsed, 500);
 }
 
+// Upper bound on raw docs fetched before grouping, so reconnect bursts assemble
+// into complete logical sessions. Admin-only and infrequent, so a wide read is
+// acceptable.
+const ADMIN_SESSION_RAW_FETCH_CAP = 500;
+
 exports.listAdminSessions = onCall({}, async (request) => {
   requireAdmin(request);
   requireAppCheck(request);
@@ -1170,16 +1176,27 @@ exports.listAdminSessions = onCall({}, async (request) => {
     query = query.orderBy("createdAt", "desc");
   }
 
-  const snap = await query.limit(limit).get();
-  const sessions = snap.docs.map((doc) =>
-    sanitizeAdminSessionDoc(doc.id, doc.data() || {})
-  );
+  const snap = await query.limit(ADMIN_SESSION_RAW_FETCH_CAP).get();
+  const rawDocs = snap.docs.map((doc) => ({
+    id: doc.id,
+    data: doc.data() || {},
+  }));
+
+  // Reconnects each create a new session doc; `groups` collapses them into
+  // logical sessions (grouped by pairing + time-proximity) with start/end.
+  // Raw `sessions` + `summary` keep their previous shape/semantics: newest
+  // `limit` docs feed both.
+  const sessions = rawDocs
+    .slice(0, limit)
+    .map(({ id, data }) => sanitizeAdminSessionDoc(id, data));
+  const groups = groupAdminSessions(rawDocs, limit);
 
   return {
     sessions: includeSessions ? sessions : [],
+    groups,
     summary: summarizeAdminSessions(sessions),
     limit,
-    truncated: snap.size >= limit,
+    truncated: snap.size >= ADMIN_SESSION_RAW_FETCH_CAP,
     generatedAt: new Date().toISOString(),
   };
 });
