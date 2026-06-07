@@ -1854,8 +1854,6 @@ exports.getSessionStats = onCall({}, async (request) => {
 // Play Store owns the trial. Codes call purchases.subscriptions.defer to add
 // 30 days to next billing date. Idempotent via absolute desiredExpiryTimeMillis.
 
-const { GoogleAuth } = require("google-auth-library");
-
 const giftCodeHmacSecret = defineSecret("GIFT_CODE_HMAC_SECRET");
 const playServiceAccountJson = defineSecret("PLAY_DEVELOPER_SERVICE_ACCOUNT_JSON");
 
@@ -2007,6 +2005,10 @@ async function getPlayApiClient() {
     throw new HttpsError("failed-precondition", "Play service account JSON malformed");
   }
   _playServiceAccountEmail = credentials.client_email || "unknown-service-account";
+  // Lazy-load: keep google-auth-library out of the cold-start module graph of
+  // getAppConfig and all other non-Play functions. require() is instance-cached,
+  // so the Play path pays this once per instance.
+  const { GoogleAuth } = require("google-auth-library");
   const auth = new GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/androidpublisher"],
