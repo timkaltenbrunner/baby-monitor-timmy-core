@@ -1670,7 +1670,16 @@ exports.snapshotSessionStats = onSchedule(
     const byProvider = {}; // any side using a given provider (union)
 
     try {
-      const snap = await db.collection("sessions").get();
+      // Read only active sessions server-side instead of scanning the whole
+      // collection every 10 min. Stale/ended docs linger up to 24h before
+      // cleanup, so an unfiltered .get() on busy days read 1000+ docs/run and
+      // blew the Firestore 50K-reads/day free tier. The JS status guard below
+      // is kept as a safety net. (single-field "in" → automatic index, no
+      // composite index needed.)
+      const snap = await db
+        .collection("sessions")
+        .where("status", "in", Array.from(ACTIVE_SESSION_STATUSES))
+        .get();
       for (const doc of snap.docs) {
         const d = doc.data() || {};
         if (!ACTIVE_SESSION_STATUSES.has(d.status)) continue;
