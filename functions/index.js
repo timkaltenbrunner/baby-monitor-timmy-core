@@ -17,7 +17,7 @@ const {
   sanitizeAdminSessionDoc,
   summarizeAdminSessions,
 } = require("./lib/admin_sessions_helpers");
-const { shouldDeleteCleanupDoc } = require("./lib/cleanup_helpers");
+const { shouldDeleteCleanupDoc, DAY_MS } = require("./lib/cleanup_helpers");
 
 initializeApp();
 
@@ -1578,8 +1578,20 @@ exports.cleanupStaleSessions = onSchedule(
     let deletedPairingCodes = 0;
     let deletedPairings = 0;
 
+    // Pre-filter with server-side range queries instead of scanning whole
+    // collections every 30 min (which read 1000+ docs/run on busy days and,
+    // alongside snapshotSessionStats, blew the Firestore 50K-reads/day free
+    // tier). Docs missing the relevant timestamp field are simply not matched —
+    // same outcome as before, since shouldDeleteCleanupDoc() already returns
+    // false for missing/invalid timestamps. That guard is kept as a safety net.
+    // All filters are single-field → automatic index, no composite needed.
+    const oneDayAgo = new Date(now.getTime() - DAY_MS);
+
     // 1. Delete sessions older than 24 hours (any status).
-    const sessionsSnap = await db.collection("sessions").get();
+    const sessionsSnap = await db
+      .collection("sessions")
+      .where("createdAt", "<", oneDayAgo)
+      .get();
     for (const doc of sessionsSnap.docs) {
       if (shouldDeleteCleanupDoc("sessions", doc.data(), now)) {
         await deleteSubcollection(db, `sessions/${doc.id}/candidates_baby`);
@@ -1590,7 +1602,10 @@ exports.cleanupStaleSessions = onSchedule(
     }
 
     // 2. Delete pairing codes older than 24 hours.
-    const pairingSnap = await db.collection("pairing_codes").get();
+    const pairingSnap = await db
+      .collection("pairing_codes")
+      .where("createdAt", "<", oneDayAgo)
+      .get();
     for (const doc of pairingSnap.docs) {
       if (shouldDeleteCleanupDoc("pairing_codes", doc.data(), now)) {
         await doc.ref.delete();
@@ -1598,9 +1613,22 @@ exports.cleanupStaleSessions = onSchedule(
       }
     }
 
-    // 3. Delete stale pairings (ended > 1 hour OR any > 24 hours)
-    const pairingsSnap = await db.collection("pairings").get();
-    for (const doc of pairingsSnap.docs) {
+    // 3. Delete stale pairings (ended > 1 hour OR any > 24 hours). Two
+    // single-field queries (createdAt range + status==ended) unioned by doc id;
+    // the updatedAt>1h check stays inside shouldDeleteCleanupDoc so we avoid a
+    // composite (status+updatedAt) index.
+    const pairingCandidates = new Map();
+    const pairingsByAge = await db
+      .collection("pairings")
+      .where("createdAt", "<", oneDayAgo)
+      .get();
+    pairingsByAge.docs.forEach((doc) => pairingCandidates.set(doc.id, doc));
+    const pairingsEnded = await db
+      .collection("pairings")
+      .where("status", "==", "ended")
+      .get();
+    pairingsEnded.docs.forEach((doc) => pairingCandidates.set(doc.id, doc));
+    for (const doc of pairingCandidates.values()) {
       if (shouldDeleteCleanupDoc("pairings", doc.data(), now)) {
         await doc.ref.delete();
         deletedPairings++;
@@ -1609,7 +1637,10 @@ exports.cleanupStaleSessions = onSchedule(
 
     // 4. Delete expired gift codes (per-doc expiresAt).
     let deletedGiftCodes = 0;
-    const giftSnap = await db.collection("gift_codes").get();
+    const giftSnap = await db
+      .collection("gift_codes")
+      .where("expiresAt", "<", now)
+      .get();
     for (const doc of giftSnap.docs) {
       if (shouldDeleteCleanupDoc("gift_codes", doc.data(), now)) {
         await doc.ref.delete();
