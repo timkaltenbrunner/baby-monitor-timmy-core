@@ -18,6 +18,11 @@ const {
   summarizeAdminSessions,
 } = require("./lib/admin_sessions_helpers");
 const { shouldDeleteCleanupDoc, DAY_MS } = require("./lib/cleanup_helpers");
+const {
+  isOneTimeProductType,
+  isPlayProductActive,
+  evaluateAppStoreOneTimeTransaction,
+} = require("./lib/onetime_purchase_helpers");
 
 initializeApp();
 
@@ -2043,6 +2048,32 @@ async function getPlaySubscription(packageName, subscriptionId, purchaseToken) {
   return res.data;
 }
 
+// One-time ("lifetime") products use the products endpoint, not subscriptions.
+// Returns a ProductPurchase resource whose `purchaseState` is 0 when purchased.
+async function getPlayProduct(packageName, productId, purchaseToken) {
+  if (isDebugPurchaseToken(purchaseToken)) {
+    console.warn("[GIFT][DEBUG-TOKEN] getPlayProduct short-circuit", {
+      packageName,
+      productId,
+      tokenPrefix: purchaseToken.slice(0, 16),
+    });
+    return { purchaseState: 0, acknowledgementState: 1 };
+  }
+  const client = await getPlayApiClient();
+  const url =
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(purchaseToken)}`;
+  const res = await client.request({ url, method: "GET", validateStatus: () => true });
+  if (res.status === 404 || res.status === 410) {
+    throw new HttpsError("not-found", "Play product purchase not found");
+  }
+  if (res.status >= 400) {
+    console.error("[Play] getProduct failed", res.status, res.data);
+    const hint = playApiPermissionHint(res.status);
+    throw new HttpsError(hint ? "failed-precondition" : "internal", hint || ("Play API error: " + res.status));
+  }
+  return res.data;
+}
+
 async function deferPlaySubscription(packageName, subscriptionId, purchaseToken, expectedExpiryMillis, desiredExpiryMillis) {
   if (isDebugPurchaseToken(purchaseToken)) {
     console.warn("[GIFT][DEBUG-TOKEN] deferPlaySubscription short-circuit", {
@@ -2293,6 +2324,98 @@ async function verifyAppStoreSignedTransaction(signedTransactionInfo, subscripti
   };
 }
 
+// Authoritative single-transaction lookup (any product type, incl.
+// non-consumables). Mirrors fetchAppStoreSubscriptionStatuses but hits the
+// Get Transaction Info endpoint, which works for products without an expiry.
+async function fetchAppStoreTransactionInfo(transactionId, environment) {
+  const config = getAppStoreServerAuthConfig();
+  if (!config || !transactionId) return null;
+  const host = environment === "Sandbox"
+    ? "https://api.storekit-sandbox.itunes.apple.com"
+    : "https://api.storekit.itunes.apple.com";
+  const response = await fetch(
+    `${host}/inApps/v1/transactions/${encodeURIComponent(transactionId)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${createAppStoreServerJwt(config)}`,
+      },
+    }
+  );
+  if (response.status === 404) {
+    const text = await response.text();
+    throw new Error(`App Store Server API transaction lookup failed: 404 ${text}`);
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new HttpsError(
+      "failed-precondition",
+      `App Store Server API transaction lookup failed: ${response.status} ${text}`
+    );
+  }
+  return response.json();
+}
+
+async function fetchAppStoreTransactionInfoWithFallback(transactionId, hintedEnvironment) {
+  const preferred = hintedEnvironment === "Sandbox"
+    ? ["Sandbox", "Production"]
+    : ["Production", "Sandbox"];
+  let lastError = null;
+  for (const environment of preferred) {
+    try {
+      return await fetchAppStoreTransactionInfo(transactionId, environment);
+    } catch (error) {
+      lastError = error;
+      if (!String(error?.message || "").includes("404")) {
+        throw error;
+      }
+    }
+  }
+  if (lastError) throw lastError;
+  return null;
+}
+
+// Verifies a one-time (non-consumable / "lifetime") App Store purchase. Unlike
+// the subscription path there is no expiry — a non-consumable stays valid
+// forever unless Apple revokes it (refund). The client-sent JWS is only used to
+// extract the transaction id; the verdict is taken from Apple's authoritative
+// transaction record (same trust model as the subscription path).
+async function verifyAppStoreOneTimePurchase(signedTransactionInfo, productId) {
+  const clientPayload = decodeJwsPayload(signedTransactionInfo);
+  if (clientPayload.productId && clientPayload.productId !== productId) {
+    throw new HttpsError("failed-precondition", "App Store transaction is for a different product");
+  }
+  const transactionId = String(
+    clientPayload.transactionId || clientPayload.originalTransactionId || ""
+  ).trim();
+  if (!transactionId) {
+    throw new HttpsError("invalid-argument", "signedTransactionInfo is missing transaction identifiers");
+  }
+
+  const info = await fetchAppStoreTransactionInfoWithFallback(
+    transactionId,
+    clientPayload.environment
+  );
+  if (!info || !info.signedTransactionInfo) {
+    throw new HttpsError(
+      "failed-precondition",
+      "App Store one-time purchase could not be verified with the App Store Server API"
+    );
+  }
+  const payload = decodeJwsPayload(info.signedTransactionInfo);
+  const verdict = evaluateAppStoreOneTimeTransaction(payload, productId);
+  if (!verdict.ok) {
+    if (verdict.reason === "product-mismatch") {
+      throw new HttpsError("failed-precondition", "App Store transaction is for a different product");
+    }
+    if (verdict.reason === "not-non-consumable") {
+      throw new HttpsError("failed-precondition", "App Store transaction is not a non-consumable purchase");
+    }
+    throw new HttpsError("failed-precondition", "App Store one-time purchase is not active");
+  }
+
+  return { expiryMillis: null, source: "app-store-server-api-onetime" };
+}
+
 async function verifyAppStoreSubscription(receiptData, subscriptionId) {
   if (isDebugPurchaseToken(receiptData)) {
     console.warn("[WEB-AUTH][DEBUG-TOKEN] App Store receipt short-circuit", {
@@ -2373,10 +2496,20 @@ async function verifyPremiumProof(proof) {
   const platform = String(proof.platform || "").trim().toLowerCase();
   const subscriptionId = proof.subscriptionId || proof.productId || "timmy_support_monthly";
   validateSubscriptionId(subscriptionId);
+  // Additive: a missing/`subscription` productType keeps the legacy auto-renewing
+  // path byte-for-byte. `onetime` selects the products / non-consumable path.
+  const isOneTimeProduct = isOneTimeProductType(proof.productType);
 
   if (platform === "android") {
     const purchaseToken = proof.purchaseToken;
     validatePurchaseToken(purchaseToken);
+    if (isOneTimeProduct) {
+      const product = await getPlayProduct(PACKAGE_NAME, subscriptionId, purchaseToken);
+      if (!isPlayProductActive(product)) {
+        throw new HttpsError("failed-precondition", "Play one-time purchase is not active");
+      }
+      return { expiryMillis: null, source: isDebugPurchaseToken(purchaseToken) ? "debug" : "play-product" };
+    }
     const sub = await getPlaySubscription(PACKAGE_NAME, subscriptionId, purchaseToken);
     const expiryMillis = readSubExpiryMillis(sub);
     if (!expiryMillis || expiryMillis < Date.now()) {
@@ -2388,8 +2521,12 @@ async function verifyPremiumProof(proof) {
   if (platform === "ios") {
     const signedTransactionInfo = proof.signedTransactionInfo;
     if (typeof signedTransactionInfo === "string" && signedTransactionInfo.trim()) {
+      if (isOneTimeProduct) {
+        return verifyAppStoreOneTimePurchase(signedTransactionInfo.trim(), subscriptionId);
+      }
       return verifyAppStoreSignedTransaction(signedTransactionInfo.trim(), subscriptionId);
     }
+    // Legacy base64 receipt path (subscription only).
     const receiptData = proof.receiptData || proof.purchaseToken;
     validateReceiptData(receiptData);
     return verifyAppStoreSubscription(receiptData, subscriptionId);
