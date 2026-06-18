@@ -5,6 +5,7 @@ const {
   isOneTimeProductType,
   isPlayProductActive,
   evaluateAppStoreOneTimeTransaction,
+  isTokenInVoidedList,
 } = require("../lib/onetime_purchase_helpers");
 
 const LIFETIME = "timmy_support_onetime";
@@ -77,4 +78,16 @@ test("App Store non-consumable rejects a revoked (refunded) transaction", () => 
 
 test("App Store non-consumable rejects a missing payload", () => {
   assert.equal(evaluateAppStoreOneTimeTransaction(null, LIFETIME).ok, false);
+});
+
+test("voided-list detection matches the refunded token", () => {
+  const voided = [
+    { purchaseToken: "other-token", orderId: "1" },
+    { purchaseToken: "refunded-token", orderId: "2" },
+  ];
+  assert.equal(isTokenInVoidedList(voided, "refunded-token"), true);
+  assert.equal(isTokenInVoidedList(voided, "active-token"), false);
+  assert.equal(isTokenInVoidedList([], "active-token"), false);
+  assert.equal(isTokenInVoidedList(undefined, "active-token"), false);
+  assert.equal(isTokenInVoidedList(voided, ""), false);
 });

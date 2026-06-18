@@ -42,8 +42,17 @@ function evaluateAppStoreOneTimeTransaction(payload, expectedProductId) {
   return { ok: true, reason: null };
 }
 
+// True if `purchaseToken` appears in a Google Play Voided Purchases list
+// (refund / chargeback / revocation). `purchaseState` alone never reflects a
+// refund for a one-time product, so this is how an Android refund is detected.
+function isTokenInVoidedList(voidedPurchases, purchaseToken) {
+  if (!Array.isArray(voidedPurchases) || !purchaseToken) return false;
+  return voidedPurchases.some((v) => v && v.purchaseToken === purchaseToken);
+}
+
 module.exports = {
   isOneTimeProductType,
   isPlayProductActive,
   evaluateAppStoreOneTimeTransaction,
+  isTokenInVoidedList,
 };

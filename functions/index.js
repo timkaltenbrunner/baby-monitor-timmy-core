@@ -22,6 +22,7 @@ const {
   isOneTimeProductType,
   isPlayProductActive,
   evaluateAppStoreOneTimeTransaction,
+  isTokenInVoidedList,
 } = require("./lib/onetime_purchase_helpers");
 
 initializeApp();
@@ -2074,6 +2075,39 @@ async function getPlayProduct(packageName, productId, purchaseToken) {
   return res.data;
 }
 
+// A one-time product's `purchaseState` never flips to cancelled on a refund or
+// chargeback — Google surfaces those via the Voided Purchases API. We list
+// voided purchases (type=1 → subscriptions + in-app) and look for the token.
+// Fails OPEN (returns false) on any API error so a transient outage never
+// revokes a valid purchase; only a token actually present in the voided list
+// counts as voided.
+async function isPlayPurchaseVoided(packageName, purchaseToken) {
+  if (isDebugPurchaseToken(purchaseToken)) return false;
+  try {
+    const client = await getPlayApiClient();
+    let pageToken;
+    for (let page = 0; page < 20; page++) {
+      const url =
+        `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/purchases/voidedpurchases?type=1` +
+        (pageToken ? `&token=${encodeURIComponent(pageToken)}` : "");
+      const res = await client.request({ url, method: "GET", validateStatus: () => true });
+      if (res.status >= 400) {
+        console.warn("[Play] voidedpurchases list failed (fail-open)", res.status);
+        return false;
+      }
+      if (isTokenInVoidedList(res.data && res.data.voidedPurchases, purchaseToken)) {
+        return true;
+      }
+      pageToken = res.data && res.data.tokenPagination && res.data.tokenPagination.nextPageToken;
+      if (!pageToken) break;
+    }
+    return false;
+  } catch (e) {
+    console.warn("[Play] voidedpurchases check error (fail-open)", e.message);
+    return false;
+  }
+}
+
 async function deferPlaySubscription(packageName, subscriptionId, purchaseToken, expectedExpiryMillis, desiredExpiryMillis) {
   if (isDebugPurchaseToken(purchaseToken)) {
     console.warn("[GIFT][DEBUG-TOKEN] deferPlaySubscription short-circuit", {
@@ -2508,6 +2542,10 @@ async function verifyPremiumProof(proof) {
       if (!isPlayProductActive(product)) {
         throw new HttpsError("failed-precondition", "Play one-time purchase is not active");
       }
+      // purchaseState never reflects a refund — check the Voided Purchases API.
+      if (await isPlayPurchaseVoided(PACKAGE_NAME, purchaseToken)) {
+        throw new HttpsError("failed-precondition", "Play one-time purchase is not active");
+      }
       return { expiryMillis: null, source: isDebugPurchaseToken(purchaseToken) ? "debug" : "play-product" };
     }
     const sub = await getPlaySubscription(PACKAGE_NAME, subscriptionId, purchaseToken);
@@ -2585,7 +2623,10 @@ async function writeActiveWebClientSession({
       webSessionId,
       pairingDocKey,
       premiumSource: premium.source,
-      premiumExpiresAt: new Date(premium.expiryMillis),
+      // One-time (lifetime) entitlements have no expiry (expiryMillis === null);
+      // store null rather than new Date(null) === 1970-01-01 (epoch).
+      premiumExpiresAt:
+        premium.expiryMillis == null ? null : new Date(premium.expiryMillis),
       authorizedAt: FieldValue.serverTimestamp(),
       refreshedAt: FieldValue.serverTimestamp(),
       leaseExpiresAt,
