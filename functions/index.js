@@ -28,7 +28,10 @@ const {
 initializeApp();
 
 const cfTurnToken = defineSecret("CLOUDFLARE_TURN_TOKEN");
-const cfTurnKeyId = defineSecret("CLOUDFLARE_TURN_KEY_ID");
+// CLOUDFLARE_TURN_KEY_ID is a non-secret identifier (used only as a path segment
+// in the Cloudflare API URL), so it lives in .env as a plain param — not in Secret
+// Manager. The real secret is cfTurnToken (Authorization header).
+const cfTurnKeyId = defineString("CLOUDFLARE_TURN_KEY_ID");
 const cfAnalyticsToken = defineSecret("CLOUDFLARE_ANALYTICS_TOKEN");
 const cfAccountId = defineString("CLOUDFLARE_ACCOUNT_ID");
 const adminUid = defineString("ADMIN_UID");
@@ -44,8 +47,10 @@ const appStoreServerKeyId = defineSecret("APP_STORE_SERVER_KEY_ID");
 const appStoreServerIssuerId = defineSecret("APP_STORE_SERVER_ISSUER_ID");
 const appStoreServerPrivateKey = defineSecret("APP_STORE_SERVER_PRIVATE_KEY");
 const appStoreBundleId = defineString("APP_STORE_BUNDLE_ID");
-const localTurnApiKey = defineSecret("LOCAL_TURN_API_KEY");
-const localTurnHmacSecret = defineSecret("LOCAL_TURN_HMAC_SECRET");
+// Local TURN credentials consolidated into a single JSON secret
+// {"apiKey":"…","hmacSecret":"…"} to stay within the Secret Manager free tier.
+// Read via getLocalTurnCredentials() (tolerates an absent/malformed secret).
+const localTurnCredentials = defineSecret("LOCAL_TURN_CREDENTIALS");
 
 const CLOUDFLARE_TURN_BUILTIN_ID = "cloudflare-builtin";
 const LOCAL_TURN_BUILTIN_ID = "local-turn-builtin";
@@ -164,6 +169,26 @@ function safeParamValue(param) {
   }
 }
 
+// Parses the consolidated LOCAL_TURN_CREDENTIALS JSON secret. Tolerates an
+// absent secret (emulator/test) or malformed JSON by returning empty fields —
+// callers already treat empty apiKey/hmacSecret as "local TURN not configured".
+function getLocalTurnCredentials() {
+  const raw = safeParamValue(localTurnCredentials);
+  if (!raw) {
+    return { apiKey: "", hmacSecret: "" };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      apiKey: String(parsed.apiKey || "").trim(),
+      hmacSecret: String(parsed.hmacSecret || "").trim(),
+    };
+  } catch (error) {
+    console.warn(`[TURN] LOCAL_TURN_CREDENTIALS is not valid JSON: ${error.message}`);
+    return { apiKey: "", hmacSecret: "" };
+  }
+}
+
 function getConfiguredWebCompanionAppIds() {
   const configured = String(safeParamValue(webCompanionAppIds) || "")
     .split(",")
@@ -249,7 +274,7 @@ function buildCloudflareBuiltinProvider(priority = 2) {
 
 function buildLocalBuiltinProvider(priority = 1) {
   const apiBaseUrl = String(safeParamValue(localTurnApiBaseUrl) || "").trim();
-  const hmacSecret = String(safeParamValue(localTurnHmacSecret) || "").trim();
+  const hmacSecret = getLocalTurnCredentials().hmacSecret;
   if (!apiBaseUrl && !hmacSecret) {
     return null;
   }
@@ -490,7 +515,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 function getLocalTurnApiHeaders() {
   return {
     Accept: "application/json",
-    Authorization: `Bearer ${localTurnApiKey.value()}`,
+    Authorization: `Bearer ${getLocalTurnCredentials().apiKey}`,
   };
 }
 
@@ -720,7 +745,7 @@ async function resolveLocalRestProvider(provider, uid) {
 
   // HMAC fallback: only reached when /load was healthy but /credentials 5xx'd.
   // Safe because the TURN URLs themselves are known reachable.
-  const hmacSecret = String(safeParamValue(localTurnHmacSecret) || "").trim();
+  const hmacSecret = getLocalTurnCredentials().hmacSecret;
   if (hmacSecret) {
     const { username, credential } = generateHmacCredentials(
       hmacSecret,
@@ -831,7 +856,7 @@ const providerResolvers = {
 // ─── getTurnCredentials ──────────────────────────────────────────────────────
 
 exports.getTurnCredentials = onCall(
-  { secrets: [cfTurnToken, cfTurnKeyId, localTurnApiKey, localTurnHmacSecret] },
+  { secrets: [cfTurnToken, localTurnCredentials] },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Must be authenticated");
@@ -922,7 +947,7 @@ exports.getTurnCredentials = onCall(
 
 // Admin-only: fetch fresh local TURN status (bypasses 30s cache for load).
 exports.getLocalTurnStatus = onCall(
-  { secrets: [localTurnApiKey] },
+  { secrets: [localTurnCredentials] },
   async (request) => {
     requireAdmin(request);
     requireAppCheck(request);
@@ -931,7 +956,7 @@ exports.getLocalTurnStatus = onCall(
 );
 
 exports.getLocalTurnLoadAdmin = onCall(
-  { secrets: [localTurnApiKey] },
+  { secrets: [localTurnCredentials] },
   async (request) => {
     requireAdmin(request);
     requireAppCheck(request);
@@ -954,7 +979,7 @@ exports.getTurnConfigAdmin = onCall(
 );
 
 exports.checkTurnHealth = onCall(
-  { secrets: [cfTurnToken, cfTurnKeyId, localTurnApiKey, localTurnHmacSecret] },
+  { secrets: [cfTurnToken, localTurnCredentials] },
   async (request) => {
     requireAdmin(request);
     requireAppCheck(request);
@@ -1018,9 +1043,7 @@ exports.checkTurnHealth = onCall(
           const apiBaseUrl = String(
             safeParamValue(localTurnApiBaseUrl) || "",
           ).trim();
-          const hmacSecret = String(
-            safeParamValue(localTurnHmacSecret) || "",
-          ).trim();
+          const hmacSecret = getLocalTurnCredentials().hmacSecret;
           let restStatus = null;
           let restDetails = "";
 
