@@ -12,6 +12,13 @@ abstract final class SignalingContract {
   static const versionField = 'version';
   static const signalingClearedAtField = 'signalingClearedAt';
 
+  /// In-session ICE-restart renegotiation round counters (optional, plaintext
+  /// metadata). [iceRestartSeqField] is written only by the baby (offerer) and
+  /// increments per renegotiation round; [iceRestartRequestSeqField] is written
+  /// only by the parent (answerer) to request a round. Absent ⇒ treat as 0.
+  static const iceRestartSeqField = 'iceRestartSeq';
+  static const iceRestartRequestSeqField = 'iceRestartRequestSeq';
+
   static const candidateField = 'candidate';
   static const sdpMidField = 'sdpMid';
   static const sdpMLineIndexField = 'sdpMLineIndex';
