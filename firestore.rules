@@ -63,7 +63,7 @@ service cloud.firestore {
          'qualityEventCount', 'qualityEventsTail', 'lastQualityEvent',
          'connectionInterruptionCount', 'lastConnectionIssue',
          'turnChangeCount', 'lastTurnChange',
-         'iceRestartSeq', 'iceRestartRequestSeq']);
+         'iceRestartSeq', 'iceRestartRequestSeq', 'recreateRequestSeq']);
     }
 
     function validCandidatePayload() {

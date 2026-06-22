@@ -19,6 +19,13 @@ abstract final class SignalingContract {
   static const iceRestartSeqField = 'iceRestartSeq';
   static const iceRestartRequestSeqField = 'iceRestartRequestSeq';
 
+  /// Cross-network roam recovery (optional, plaintext). Written only by the
+  /// parent on a WiFi<->cellular roam to ask the baby to recreate the session
+  /// immediately (a fresh full reconnect) instead of a doomed in-session ICE
+  /// restart — the relay can't be rebuilt in place across the roam. Monotonic;
+  /// absent ⇒ treat as 0.
+  static const recreateRequestSeqField = 'recreateRequestSeq';
+
   static const candidateField = 'candidate';
   static const sdpMidField = 'sdpMid';
   static const sdpMLineIndexField = 'sdpMLineIndex';
