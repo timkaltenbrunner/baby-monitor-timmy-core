@@ -17,7 +17,7 @@ const {
   sanitizeAdminSessionDoc,
   summarizeAdminSessions,
 } = require("./lib/admin_sessions_helpers");
-const { shouldDeleteCleanupDoc, DAY_MS } = require("./lib/cleanup_helpers");
+const { shouldDeleteCleanupDoc, DAY_MS, HOUR_MS } = require("./lib/cleanup_helpers");
 const {
   isOneTimeProductType,
   isPlayProductActive,
@@ -1615,6 +1615,7 @@ exports.cleanupStaleSessions = onSchedule(
     // false for missing/invalid timestamps. That guard is kept as a safety net.
     // All filters are single-field → automatic index, no composite needed.
     const oneDayAgo = new Date(now.getTime() - DAY_MS);
+    const oneHourAgo = new Date(now.getTime() - HOUR_MS);
 
     // 1. Delete sessions older than 24 hours (any status).
     const sessionsSnap = await db
@@ -1630,10 +1631,12 @@ exports.cleanupStaleSessions = onSchedule(
       }
     }
 
-    // 2. Delete pairing codes older than 24 hours.
+    // 2. Delete pairing codes older than 1 hour (meeting points are only live
+    // during the brief ECDH handshake; short retention keeps Nearby discovery
+    // from rediscovering stale codes and computing a bogus SAS on a re-pair).
     const pairingSnap = await db
       .collection("pairing_codes")
-      .where("createdAt", "<", oneDayAgo)
+      .where("createdAt", "<", oneHourAgo)
       .get();
     for (const doc of pairingSnap.docs) {
       if (shouldDeleteCleanupDoc("pairing_codes", doc.data(), now)) {
