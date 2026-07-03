@@ -32,3 +32,29 @@ test("cleanup still deletes expired gift codes and stale session docs", () => {
     true
   );
 });
+
+test("cleanup purges pairing_codes after 1h but keeps fresh ones", () => {
+  const now = new Date("2026-04-01T00:00:00Z");
+
+  // Older than 1h → delete (previously survived under the 24h threshold).
+  assert.equal(
+    shouldDeleteCleanupDoc("pairing_codes", {
+      createdAt: new Date("2026-03-31T22:30:00Z"), // 90 min ago
+    }, now),
+    true
+  );
+  // Younger than 1h → keep (a live handshake must not be purged).
+  assert.equal(
+    shouldDeleteCleanupDoc("pairing_codes", {
+      createdAt: new Date("2026-03-31T23:30:00Z"), // 30 min ago
+    }, now),
+    false
+  );
+  // Guard: the 1h threshold must NOT bleed into sessions (still 24h).
+  assert.equal(
+    shouldDeleteCleanupDoc("sessions", {
+      createdAt: new Date("2026-03-31T22:30:00Z"), // 90 min ago
+    }, now),
+    false
+  );
+});

@@ -19,8 +19,12 @@ function shouldDeleteCleanupDoc(collection, data = {}, now = new Date()) {
 
   switch (collection) {
     case "sessions":
-    case "pairing_codes":
       return olderThan(data.createdAt, oneDayAgo);
+    case "pairing_codes":
+      // Meeting points are only live during the seconds-long ECDH handshake.
+      // Purge after 1h so a day of testing can't accumulate dozens of stale
+      // docs that pollute Nearby discovery (bogus SAS on a re-pair).
+      return olderThan(data.createdAt, oneHourAgo);
     case "pairings":
       return (
         (data.status === "ended" && olderThan(data.updatedAt, oneHourAgo)) ||
