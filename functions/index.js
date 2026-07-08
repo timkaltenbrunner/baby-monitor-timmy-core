@@ -3210,3 +3210,162 @@ exports.redeemCampaignCode = onCall(
     return { ok: true, deferDays, newExpiryMillis };
   }
 );
+
+// ─── Problem reports (user feedback) ─────────────────────────────────────────
+//
+// submitProblemReport   — any authenticated app client files a free-text report,
+//                         optionally with lightweight diagnostic context.
+// listProblemReports    — admin-only: read reports for the dashboard.
+// deleteProblemReport   — admin-only: remove a handled report.
+//
+// The `problem_reports` collection is server-owned (rules: read admin, write
+// false); all writes/deletes go through these callables via the admin SDK.
+
+const problemReportRateLimitMap = new Map();
+const PROBLEM_REPORT_MAX = 5; // per uid per rate-limit window (1h)
+
+const PROBLEM_REPORT_CATEGORIES = new Set([
+  "connection",
+  "audio",
+  "video",
+  "pairing",
+  "other",
+]);
+
+const PROBLEM_REPORT_MESSAGE_MAX = 2000;
+const PROBLEM_REPORT_EVENTS_MAX = 50;
+// Hard cap on the stored diagnostics blob so a crafted client can't bloat docs.
+const PROBLEM_REPORT_DIAGNOSTICS_MAX_BYTES = 16 * 1024;
+
+function sanitizeReportString(value, maxLen) {
+  if (typeof value !== "string") return "";
+  return value.slice(0, maxLen);
+}
+
+function sanitizeReportDiagnostics(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const out = {};
+  out.appVersion = sanitizeReportString(raw.appVersion, 32);
+  out.buildNumber = sanitizeReportString(raw.buildNumber, 32);
+  out.platform = sanitizeReportString(raw.platform, 32);
+  out.locale = sanitizeReportString(raw.locale, 32);
+
+  if (Array.isArray(raw.recentEvents)) {
+    out.recentEvents = raw.recentEvents
+      .slice(0, PROBLEM_REPORT_EVENTS_MAX)
+      .map((e) => {
+        const ev = { type: sanitizeReportString(e && e.type, 20) };
+        const ts = e && e.tsMillis;
+        if (typeof ts === "number" && Number.isFinite(ts)) ev.tsMillis = ts;
+        const nl = e && e.noiseLevel;
+        if (typeof nl === "number" && Number.isFinite(nl)) ev.noiseLevel = nl;
+        return ev;
+      });
+  }
+
+  // If the blob is still oversized, drop the event tail (the largest field)
+  // before giving up, so at least the device/version context survives.
+  if (JSON.stringify(out).length > PROBLEM_REPORT_DIAGNOSTICS_MAX_BYTES) {
+    delete out.recentEvents;
+  }
+  if (JSON.stringify(out).length > PROBLEM_REPORT_DIAGNOSTICS_MAX_BYTES) {
+    return null;
+  }
+  return out;
+}
+
+exports.submitProblemReport = onCall({}, async (request) => {
+  requireAppCheck(request);
+  requireAuth(request);
+  if (
+    !checkRateLimit(
+      problemReportRateLimitMap,
+      request.auth.uid,
+      PROBLEM_REPORT_MAX
+    )
+  ) {
+    throw new HttpsError("resource-exhausted", "Too many reports");
+  }
+
+  const message = sanitizeReportString(
+    request.data?.message,
+    PROBLEM_REPORT_MESSAGE_MAX
+  ).trim();
+  if (message.length === 0) {
+    throw new HttpsError("invalid-argument", "Message must not be empty");
+  }
+
+  const rawCategory = request.data?.category;
+  const category = PROBLEM_REPORT_CATEGORIES.has(rawCategory)
+    ? rawCategory
+    : "other";
+
+  const includeDiagnostics = request.data?.includeDiagnostics === true;
+  const diagnostics = includeDiagnostics
+    ? sanitizeReportDiagnostics(request.data?.diagnostics)
+    : null;
+
+  const db = getFirestore();
+  const ref = await db.collection("problem_reports").add({
+    uid: request.auth.uid,
+    message,
+    category,
+    includeDiagnostics,
+    diagnostics,
+    status: "new",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  return { ok: true, id: ref.id };
+});
+
+exports.listProblemReports = onCall({}, async (request) => {
+  requireAdmin(request);
+  requireAppCheck(request);
+
+  const db = getFirestore();
+  const limit = parseAdminSessionLimit(request.data?.limit);
+  const snap = await db
+    .collection("problem_reports")
+    .orderBy("createdAt", "desc")
+    .limit(limit)
+    .get();
+
+  const reports = snap.docs.map((doc) => {
+    const data = doc.data() || {};
+    const createdAt =
+      data.createdAt && typeof data.createdAt.toMillis === "function"
+        ? data.createdAt.toMillis()
+        : null;
+    return {
+      id: doc.id,
+      uid: data.uid || null,
+      message: data.message || "",
+      category: data.category || "other",
+      includeDiagnostics: data.includeDiagnostics === true,
+      diagnostics: data.diagnostics || null,
+      status: data.status || "new",
+      createdAtMillis: createdAt,
+    };
+  });
+
+  return {
+    reports,
+    limit,
+    generatedAt: new Date().toISOString(),
+  };
+});
+
+exports.deleteProblemReport = onCall({}, async (request) => {
+  requireAdmin(request);
+  requireAppCheck(request);
+
+  const id = request.data?.id;
+  if (typeof id !== "string" || id.length === 0 || id.length > 128 ||
+      id.includes("/")) {
+    throw new HttpsError("invalid-argument", "Invalid report id");
+  }
+
+  await getFirestore().collection("problem_reports").doc(id).delete();
+  return { ok: true };
+});

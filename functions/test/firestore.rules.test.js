@@ -141,3 +141,33 @@ test("campaign configuration writes stay admin-only", async () => {
     })
   );
 });
+
+test("problem reports: clients cannot write directly", async () => {
+  const db = testEnv.authenticatedContext("user-1").firestore();
+
+  await assertFails(
+    setDoc(doc(db, "problem_reports", "report-1"), {
+      uid: "user-1",
+      message: "audio drops",
+      category: "audio",
+      status: "new",
+    })
+  );
+});
+
+test("problem reports: only admin can read", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    await setDoc(doc(context.firestore(), "problem_reports", "report-1"), {
+      uid: "user-1",
+      message: "audio drops",
+      category: "audio",
+      status: "new",
+    });
+  });
+
+  const userDb = testEnv.authenticatedContext("user-1").firestore();
+  await assertFails(getDoc(doc(userDb, "problem_reports", "report-1")));
+
+  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
+  await assertSucceeds(getDoc(doc(adminDb, "problem_reports", "report-1")));
+});

@@ -162,5 +162,13 @@ service cloud.firestore {
       allow read: if false;
       allow write: if false;
     }
+
+    // User problem reports. Server-owned: submitted/deleted via callables
+    // (submitProblemReport / deleteProblemReport) which use the admin SDK.
+    // Only the admin can read; clients can never write directly.
+    match /problem_reports/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
   }
 }
