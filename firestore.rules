@@ -163,6 +163,21 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Premium grant tokens for the shared premium link. Server-owned: the token
+    // is validated + redeemed inside verifySubscriptionEntitlement (admin SDK),
+    // created by an admin script. Clients never read/write these directly.
+    match /grant_tokens/{token} {
+      allow read, write: if false;
+    }
+
+    match /grant_redemptions/{id} {
+      allow read, write: if false;
+    }
+
+    match /premium_grants/{uid} {
+      allow read, write: if false;
+    }
+
     // User problem reports. Server-owned: submitted/deleted via callables
     // (submitProblemReport / deleteProblemReport) which use the admin SDK.
     // Only the admin can read; clients can never write directly.

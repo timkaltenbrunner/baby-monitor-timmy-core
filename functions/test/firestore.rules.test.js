@@ -171,3 +171,32 @@ test("problem reports: only admin can read", async () => {
   const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
   await assertSucceeds(getDoc(doc(adminDb, "problem_reports", "report-1")));
 });
+
+test("premium grant collections are fully server-only (even for admin)", async () => {
+  const userDb = testEnv.authenticatedContext("user-1").firestore();
+  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
+
+  // Seed docs bypassing rules so read attempts have something to fetch.
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "grant_tokens", "HC7Y86PTQHCLAC"), { active: true });
+    await setDoc(doc(db, "grant_redemptions", "HC7Y86PTQHCLAC_user-1"), {
+      uid: "user-1",
+    });
+    await setDoc(doc(db, "premium_grants", "user-1"), { source: "grant" });
+  });
+
+  for (const db of [userDb, adminDb]) {
+    await assertFails(getDoc(doc(db, "grant_tokens", "HC7Y86PTQHCLAC")));
+    await assertFails(
+      setDoc(doc(db, "grant_tokens", "HC7Y86PTQHCLAC"), { active: false })
+    );
+    await assertFails(
+      getDoc(doc(db, "grant_redemptions", "HC7Y86PTQHCLAC_user-1"))
+    );
+    await assertFails(getDoc(doc(db, "premium_grants", "user-1")));
+    await assertFails(
+      setDoc(doc(db, "premium_grants", "user-1"), { source: "hack" })
+    );
+  }
+});

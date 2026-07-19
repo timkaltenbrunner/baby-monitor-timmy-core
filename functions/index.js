@@ -2549,9 +2549,103 @@ async function verifyAppStoreSubscription(receiptData, subscriptionId) {
   };
 }
 
-async function verifyPremiumProof(proof) {
+// ─── Premium grant (shared premium link → forever entitlement) ───────────────
+// A grant token from the shared premium link (babyphone-timmy.ch/premium?g=…)
+// unlocks premium forever WITHOUT a store purchase. It is the production-safe
+// analogue of the debug-e2e- short-circuit: the client persists a synthetic
+// `grant-<token>` "purchase" and re-verifies it every launch.
+//
+// Per-user durability: once `grant_redemptions/{token}_{uid}` exists the user
+// stays premium forever regardless of the token's active/maxRedemptions state,
+// so deactivating a token (kill-switch) stops NEW grants without revoking the
+// people who already redeemed it, and per-launch re-verification is idempotent.
+const GRANT_TOKEN_REGEX = /^[A-Z0-9]{6,64}$/;
+
+function extractGrantToken(proof) {
+  const candidates = [proof.grantToken];
+  for (const slot of [proof.purchaseToken, proof.signedTransactionInfo]) {
+    if (typeof slot === "string" && slot.startsWith("grant-")) {
+      candidates.push(slot.slice("grant-".length));
+    }
+  }
+  for (const raw of candidates) {
+    if (typeof raw !== "string") continue;
+    const token = raw.trim().toUpperCase();
+    if (GRANT_TOKEN_REGEX.test(token)) return token;
+  }
+  return null;
+}
+
+async function verifyPremiumGrant(token, uid) {
+  if (!uid) {
+    throw new HttpsError(
+      "unauthenticated",
+      "Premium grant requires an authenticated user"
+    );
+  }
+  const db = getFirestore();
+  const redemptionRef = db.collection("grant_redemptions").doc(`${token}_${uid}`);
+  const tokenRef = db.collection("grant_tokens").doc(token);
+  const grantRef = db.collection("premium_grants").doc(uid);
+
+  const active = await db.runTransaction(async (tx) => {
+    // Reads first (Firestore requires all reads before any writes).
+    const redemptionSnap = await tx.get(redemptionRef);
+    if (redemptionSnap.exists) return true; // durable: already granted forever
+    const tokenSnap = await tx.get(tokenRef);
+    if (!tokenSnap.exists) return false;
+    const data = tokenSnap.data() || {};
+    if (data.active !== true) return false;
+    if (
+      data.expiresAt &&
+      typeof data.expiresAt.toMillis === "function" &&
+      data.expiresAt.toMillis() < Date.now()
+    ) {
+      return false;
+    }
+    if (
+      typeof data.maxRedemptions === "number" &&
+      (data.redemptionCount || 0) >= data.maxRedemptions
+    ) {
+      return false;
+    }
+    // First redemption for this uid: record it durably + count it once.
+    tx.set(redemptionRef, {
+      token,
+      uid,
+      grantedAt: FieldValue.serverTimestamp(),
+    });
+    tx.set(
+      grantRef,
+      {
+        token,
+        source: "grant",
+        expiryMillis: null,
+        grantedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    tx.update(tokenRef, { redemptionCount: FieldValue.increment(1) });
+    return true;
+  });
+
+  if (!active) {
+    // "is not active" is the exact substring the client treats as a terminal
+    // verdict, so a fresh redeemer of a deactivated/exhausted token is dropped.
+    throw new HttpsError("failed-precondition", "Premium grant is not active");
+  }
+  return { expiryMillis: null, source: "grant" };
+}
+
+async function verifyPremiumProof(proof, uid) {
   if (!proof || typeof proof !== "object") {
     throw new HttpsError("invalid-argument", "Premium proof required");
+  }
+  // Grant tokens short-circuit BEFORE any store-product / purchaseToken
+  // validation — the synthetic token is neither a product id nor a Play token.
+  const grantToken = extractGrantToken(proof);
+  if (grantToken) {
+    return verifyPremiumGrant(grantToken, uid);
   }
   const platform = String(proof.platform || "").trim().toLowerCase();
   const subscriptionId = proof.subscriptionId || proof.productId || "timmy_support_monthly";
@@ -2723,7 +2817,10 @@ exports.verifySubscriptionEntitlement = onCall(
       throw new HttpsError("resource-exhausted", "Too many entitlement verification requests");
     }
 
-    const premium = await verifyPremiumProof(request.data?.premiumProof);
+    const premium = await verifyPremiumProof(
+      request.data?.premiumProof,
+      request.auth.uid
+    );
     return {
       ok: true,
       active: true,
@@ -2762,7 +2859,10 @@ exports.authorizeWebClient = onCall(
     validateUid(webUid, "webUid");
     validateWebField(webSessionId, "webSessionId");
 
-    const premium = await verifyPremiumProof(request.data?.premiumProof);
+    const premium = await verifyPremiumProof(
+      request.data?.premiumProof,
+      request.auth.uid
+    );
     const session = await writeActiveWebClientSession({
       mobileUid: request.auth.uid,
       webUid,
