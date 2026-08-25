@@ -26,10 +26,15 @@ function shouldDeleteCleanupDoc(collection, data = {}, now = new Date()) {
       // docs that pollute Nearby discovery (bogus SAS on a re-pair).
       return olderThan(data.createdAt, oneHourAgo);
     case "pairings":
-      return (
-        (data.status === "ended" && olderThan(data.updatedAt, oneHourAgo)) ||
-        olderThan(data.createdAt, oneDayAgo)
-      );
+      if (data.status === "ended") {
+        return olderThan(data.updatedAt ?? data.createdAt, oneHourAgo);
+      }
+      // Pairings represent long-lived saved connections. Keep any non-ended
+      // pairing for 24 hours after its latest activity so an active monitoring
+      // session is never deleted merely because the devices were paired long
+      // ago. The createdAt fallback only covers historical/synthetic records;
+      // production clients already write updatedAt.
+      return olderThan(data.updatedAt ?? data.createdAt, oneDayAgo);
     case "gift_codes":
       return olderThan(data.expiresAt, now);
     case "campaign_redemptions":
