@@ -1592,9 +1592,9 @@ exports.cacheTurnUsage = onSchedule(
  * - Session documents: kept up to 24 hours after creation, then deleted
  *   (regardless of status). Active SDP/ICE candidate data is cleared by the
  *   client immediately after the WebRTC connection is established.
- * - Pairing_codes (ECDH meeting points): kept up to 24 hours.
- * - Pairings: kept up to 24 hours; ended pairings older than 1 hour are
- *   removed earlier to allow re-pairing.
+ * - Pairing_codes (ECDH meeting points): kept up to 1 hour after creation.
+ * - Pairings: kept up to 24 hours after their latest activity; ended pairings
+ *   older than 1 hour are removed earlier to allow re-pairing.
  * - Campaign_redemptions: retained as a permanent hash/idempotency ledger.
  */
 exports.cleanupStaleSessions = onSchedule(
@@ -1645,14 +1645,14 @@ exports.cleanupStaleSessions = onSchedule(
       }
     }
 
-    // 3. Delete stale pairings (ended > 1 hour OR any > 24 hours). Two
-    // single-field queries (createdAt range + status==ended) unioned by doc id;
+    // 3. Delete stale pairings (ended > 1 hour OR inactive > 24 hours). Two
+    // single-field queries (updatedAt range + status==ended) unioned by doc id;
     // the updatedAt>1h check stays inside shouldDeleteCleanupDoc so we avoid a
     // composite (status+updatedAt) index.
     const pairingCandidates = new Map();
     const pairingsByAge = await db
       .collection("pairings")
-      .where("createdAt", "<", oneDayAgo)
+      .where("updatedAt", "<", oneDayAgo)
       .get();
     pairingsByAge.docs.forEach((doc) => pairingCandidates.set(doc.id, doc));
     const pairingsEnded = await db
