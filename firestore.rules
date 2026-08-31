@@ -83,6 +83,40 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    // Session analytics is server-only. In particular it must not live under
+    // /admin, whose historical rule allows every signed-in client to read.
+    match /session_analytics_segments/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_pairing_days/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_daily/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_overrides/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_override_audit/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_rebuild_jobs/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_dirty_days/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /session_analytics_day_leases/{document=**} {
+      allow read, write: if false;
+    }
+
     match /web_client_sessions/{webUid} {
       allow read: if signedIn() && request.auth.uid == webUid;
       allow write: if false;

@@ -200,3 +200,32 @@ test("premium grant collections are fully server-only (even for admin)", async (
     );
   }
 });
+
+test("all session analytics collections are fully server-only even for admin", async () => {
+  const collectionNames = [
+    "session_analytics_segments",
+    "session_analytics_pairing_days",
+    "session_analytics_daily",
+    "session_analytics_overrides",
+    "session_analytics_override_audit",
+    "session_analytics_rebuild_jobs",
+    "session_analytics_dirty_days",
+    "session_analytics_day_leases",
+  ];
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    for (const collectionName of collectionNames) {
+      await setDoc(doc(context.firestore(), collectionName, "private"), {
+        value: "private",
+      });
+    }
+  });
+
+  const userDb = testEnv.authenticatedContext("user-1").firestore();
+  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
+  for (const collectionName of collectionNames) {
+    for (const db of [userDb, adminDb]) {
+      await assertFails(getDoc(doc(db, collectionName, "private")));
+      await assertFails(setDoc(doc(db, collectionName, "private"), { hacked: true }));
+    }
+  }
+});
