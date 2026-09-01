@@ -38,6 +38,7 @@ That allows external reviewers to verify:
 | `docs/SECURITY.md` | Technical security architecture for WebRTC and pairing |
 | `docs/public-scope.md` | What is public here and what remains in the private app repo |
 | `docs/verification.md` | Local verification commands for package, functions, and rules |
+| `docs/session_analytics.md` | Fail-closed daily session analytics and rollout runbook |
 
 ## Quickstart
 

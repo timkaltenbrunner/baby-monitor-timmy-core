@@ -39,7 +39,11 @@ do NOT fork backend logic. All Cloud Functions changes happen **here**.
 - Hard secrets (`defineSecret`) live in Google Secret Manager:
   `CLOUDFLARE_TURN_TOKEN`, `LOCAL_TURN_API_KEY`, `LOCAL_TURN_HMAC_SECRET`,
   `APP_STORE_SERVER_KEY_ID`, `APP_STORE_SERVER_ISSUER_ID`, `APP_STORE_SERVER_PRIVATE_KEY`,
-  `PLAY_SERVICE_ACCOUNT_JSON`.
+  `PLAY_SERVICE_ACCOUNT_JSON`, `SESSION_ANALYTICS_HMAC_KEY`.
+
+Daily session analytics is documented in `docs/session_analytics.md`. Its
+top-level collections are server-only, and its trigger must never write to
+`/sessions` or perform scheduled full scans of that collection.
 
 ### Deploy (auth: `~/workarea/git/firebase-credentials.json` refresh token)
 ```bash

@@ -1,5 +1,6 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onDocumentWritten } = require("firebase-functions/v2/firestore");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
@@ -24,6 +25,22 @@ const {
   evaluateAppStoreOneTimeTransaction,
   isTokenInVoidedList,
 } = require("./lib/onetime_purchase_helpers");
+const {
+  hasRelevantSessionChange,
+  normalizeAnalyticsSecret,
+  sanitizeSessionAnalyticsSource,
+} = require("./lib/session_analytics_helpers");
+const {
+  COLLECTIONS: SESSION_ANALYTICS_COLLECTIONS,
+  captureSessionSnapshots,
+  cleanupExpiredAnalytics,
+  createOverride: createSessionAnalyticsOverride,
+  getDailyAnalytics,
+  listPairingDaysPage,
+  loadAnalyticsConfig,
+  processNextRebuildJob,
+  runScheduledAggregation,
+} = require("./lib/session_analytics_service");
 
 initializeApp();
 
@@ -51,6 +68,9 @@ const appStoreBundleId = defineString("APP_STORE_BUNDLE_ID");
 // {"apiKey":"…","hmacSecret":"…"} to stay within the Secret Manager free tier.
 // Read via getLocalTurnCredentials() (tolerates an absent/malformed secret).
 const localTurnCredentials = defineSecret("LOCAL_TURN_CREDENTIALS");
+// Dedicated, versioned namespace for pseudonymising analytics pairing ids.
+// It is deliberately not shared with gift codes, TURN or signaling secrets.
+const sessionAnalyticsHmacKey = defineSecret("SESSION_ANALYTICS_HMAC_KEY");
 
 const CLOUDFLARE_TURN_BUILTIN_ID = "cloudflare-builtin";
 const LOCAL_TURN_BUILTIN_ID = "local-turn-builtin";
@@ -1250,6 +1270,283 @@ exports.listAdminSessions = onCall({}, async (request) => {
     limit,
     truncated: snap.size >= ADMIN_SESSION_RAW_FETCH_CAP,
     generatedAt: new Date().toISOString(),
+  };
+});
+
+// ─── Daily session analytics (admin only, app-independent) ──────────────────
+//
+// Analytics is a one-way projection of existing /sessions documents. None of
+// these functions writes to /sessions or participates in signaling. Every
+// switch fails closed when the config document is absent or malformed.
+
+let _sessionAnalyticsConfigCache = null;
+let _sessionAnalyticsConfigCacheAt = 0;
+const SESSION_ANALYTICS_CONFIG_CACHE_MS = 60 * 1000;
+const SESSION_ANALYTICS_DEBOUNCE_MS = 8 * 1000;
+const _sessionAnalyticsPendingCaptures = new Map();
+
+async function getSessionAnalyticsConfig(force = false) {
+  const now = Date.now();
+  if (
+    !force &&
+    _sessionAnalyticsConfigCache &&
+    now - _sessionAnalyticsConfigCacheAt < SESSION_ANALYTICS_CONFIG_CACHE_MS
+  ) {
+    return _sessionAnalyticsConfigCache;
+  }
+  const config = await loadAnalyticsConfig(getFirestore());
+  _sessionAnalyticsConfigCache = config;
+  _sessionAnalyticsConfigCacheAt = now;
+  return config;
+}
+
+function requireAdminAndAppCheck(request) {
+  requireAdmin(request);
+  if (!request.app) {
+    throw new HttpsError("failed-precondition", "App Check token missing");
+  }
+}
+
+async function requireVisibleSessionAnalytics(request) {
+  requireAdminAndAppCheck(request);
+  const config = await getSessionAnalyticsConfig();
+  if (!config.adminVisible) {
+    throw new HttpsError("not-found", "Session analytics is not available");
+  }
+  return config;
+}
+
+function requireSessionAnalyticsSecret() {
+  const secret = normalizeAnalyticsSecret(safeParamValue(sessionAnalyticsHmacKey));
+  if (!secret) {
+    throw new HttpsError("failed-precondition", "Session analytics secret unavailable");
+  }
+  return secret;
+}
+
+function enqueueSessionAnalyticsCapture({
+  db,
+  sessionId,
+  data,
+  sourceUpdateTime,
+  config,
+  secret,
+}) {
+  let entry = _sessionAnalyticsPendingCaptures.get(sessionId);
+  if (!entry) {
+    let resolvePromise;
+    let rejectPromise;
+    const promise = new Promise((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    entry = {
+      db,
+      sessionId,
+      config,
+      secret,
+      snapshots: [],
+      timer: null,
+      promise,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+    };
+    _sessionAnalyticsPendingCaptures.set(sessionId, entry);
+  }
+
+  entry.snapshots.push({
+    data: sanitizeSessionAnalyticsSource(data),
+    sourceUpdateTime,
+    captureSource: "live",
+  });
+  clearTimeout(entry.timer);
+  entry.timer = setTimeout(async () => {
+    // Removing before the read gives an event racing with this flush its own
+    // trailing capture; monotone merge makes the two writes safe in any order.
+    _sessionAnalyticsPendingCaptures.delete(sessionId);
+    try {
+      // Eventarc already delivered every relevant immutable snapshot. An event
+      // racing this flush gets its own trailing entry and monotone merge. A
+      // point-read of /sessions here would add one billed read per flush and is
+      // unnecessary for correctness.
+      const result = await captureSessionSnapshots({
+        db: entry.db,
+        sessionId: entry.sessionId,
+        snapshots: entry.snapshots,
+        hmacSecret: entry.secret,
+        config: entry.config,
+      });
+      entry.resolve(result);
+    } catch (error) {
+      entry.reject(error);
+    }
+  }, SESSION_ANALYTICS_DEBOUNCE_MS);
+  return entry.promise;
+}
+
+exports.captureSessionAnalyticsSegment = onDocumentWritten(
+  {
+    document: "sessions/{sessionId}",
+    secrets: [sessionAnalyticsHmacKey],
+    maxInstances: 1,
+    concurrency: 80,
+    timeoutSeconds: 120,
+    retry: true,
+  },
+  async (event) => {
+    const before = event.data?.before;
+    const after = event.data?.after;
+    // Cleanup deletes are intentionally ignored.
+    if (!after?.exists) return;
+    const beforeData = before?.exists ? before.data() : null;
+    const afterData = after.data() || {};
+    // SDP/ICE-only updates stop here without an analytics read or write.
+    if (!hasRelevantSessionChange(beforeData, afterData)) return;
+
+    const config = await getSessionAnalyticsConfig();
+    if (!config.captureEnabled || !config.hmacKeyVersion) return;
+    const secret = normalizeAnalyticsSecret(safeParamValue(sessionAnalyticsHmacKey));
+    if (!secret) {
+      console.error("[session-analytics] HMAC key missing or too short; capture disabled");
+      return;
+    }
+    const result = await enqueueSessionAnalyticsCapture({
+      db: getFirestore(),
+      sessionId: event.params.sessionId,
+      data: afterData,
+      sourceUpdateTime: after.updateTime || event.time || afterData.updatedAt,
+      config,
+      secret,
+    });
+    if (!["unchanged", "stale", "disabled"].includes(result.status)) {
+      console.log(`[session-analytics] segment ${result.status}`);
+    }
+  }
+);
+
+exports.aggregateDailySessionAnalytics = onSchedule(
+  {
+    // 04:15 exists exactly once on every Zurich civil day. 02:15 would be
+    // skipped/duplicated at the spring/autumn DST transitions.
+    schedule: "15 4 * * *",
+    timeZone: "Europe/Zurich",
+    timeoutSeconds: 540,
+    maxInstances: 1,
+    concurrency: 1,
+  },
+  async () => {
+    const config = await getSessionAnalyticsConfig(true);
+    if (!config.aggregationEnabled) return;
+    const result = await runScheduledAggregation(getFirestore(), config);
+    console.log(`[session-analytics] daily aggregation ${JSON.stringify(result)}`);
+  }
+);
+
+exports.processSessionAnalyticsRebuilds = onSchedule(
+  {
+    schedule: "every 5 minutes",
+    timeoutSeconds: 540,
+    maxInstances: 1,
+    concurrency: 1,
+  },
+  async () => {
+    const config = await getSessionAnalyticsConfig(true);
+    if (!config.aggregationEnabled) return;
+    const result = await processNextRebuildJob(getFirestore(), config);
+    if (result.status !== "idle") {
+      console.log(`[session-analytics] rebuild ${JSON.stringify(result)}`);
+    }
+  }
+);
+
+exports.cleanupSessionAnalytics = onSchedule(
+  {
+    // Four runs per day plus bounded retries keep physical deletion inside the
+    // public retention maxima even when one scheduler invocation is transiently
+    // unavailable or a 5,000-document safety chunk needs continuation.
+    schedule: "10 */6 * * *",
+    timeZone: "Europe/Zurich",
+    timeoutSeconds: 300,
+    maxInstances: 1,
+    concurrency: 1,
+    retryCount: 3,
+    maxRetrySeconds: 3 * 60 * 60,
+    minBackoffSeconds: 60,
+    maxBackoffSeconds: 30 * 60,
+  },
+  async () => {
+    const result = await cleanupExpiredAnalytics(getFirestore());
+    console.log(`[session-analytics] retention ${JSON.stringify(result)}`);
+    if (result.cappedCollections.length > 0) {
+      throw new Error(
+        `Session analytics cleanup cap reached: ${result.cappedCollections.join(",")}`
+      );
+    }
+  }
+);
+
+exports.getDailySessionAnalytics = onCall({}, async (request) => {
+  const config = await requireVisibleSessionAnalytics(request);
+  return getDailyAnalytics(getFirestore(), request.data?.days, config);
+});
+
+exports.listSessionAnalyticsPairingDays = onCall(
+  { secrets: [sessionAnalyticsHmacKey] },
+  async (request) => {
+    const config = await requireVisibleSessionAnalytics(request);
+    const secret = requireSessionAnalyticsSecret();
+    try {
+      return await listPairingDaysPage(getFirestore(), {
+        day: request.data?.day,
+        classification: request.data?.classification,
+        pageSize: request.data?.pageSize,
+        cursor: request.data?.cursor,
+        secret,
+        autoExclusionEnabled: config.autoExclusionEnabled,
+      });
+    } catch (error) {
+      throw new HttpsError("invalid-argument", error.message);
+    }
+  }
+);
+
+exports.setSessionAnalyticsOverride = onCall(
+  { secrets: [sessionAnalyticsHmacKey] },
+  async (request) => {
+    const config = await requireVisibleSessionAnalytics(request);
+    const secret = requireSessionAnalyticsSecret();
+    try {
+      return await createSessionAnalyticsOverride(
+        getFirestore(),
+        request.data || {},
+        request.auth.uid,
+        secret,
+        { autoExclusionEnabled: config.autoExclusionEnabled }
+      );
+    } catch (error) {
+      throw new HttpsError("invalid-argument", error.message);
+    }
+  }
+);
+
+exports.getSessionAnalyticsRebuildStatus = onCall({}, async (request) => {
+  await requireVisibleSessionAnalytics(request);
+  const jobId = String(request.data?.jobId || "");
+  if (!/^[A-Za-z0-9]{10,64}$/.test(jobId)) {
+    throw new HttpsError("invalid-argument", "Invalid rebuild job id");
+  }
+  const snap = await getFirestore()
+    .collection(SESSION_ANALYTICS_COLLECTIONS.rebuildJobs)
+    .doc(jobId)
+    .get();
+  if (!snap.exists) throw new HttpsError("not-found", "Rebuild job not found");
+  const data = snap.data() || {};
+  return {
+    jobId,
+    status: data.status || "unknown",
+    processedDays: Number(data.processedDays || 0),
+    error: data.status === "failed" ? String(data.error || "Unknown error") : null,
+    updatedAt: data.updatedAt?.toDate?.()?.toISOString?.() || null,
   };
 });
 
