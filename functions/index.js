@@ -985,7 +985,7 @@ exports.getLocalTurnLoadAdmin = onCall(
 );
 
 exports.getTurnConfigAdmin = onCall(
-  {},
+  { secrets: [localTurnCredentials] },
   async (request) => {
     requireAdmin(request);
     requireAppCheck(request);
@@ -1188,7 +1188,7 @@ exports.checkTurnHealth = onCall(
 );
 
 exports.setTurnConfigAdmin = onCall(
-  {},
+  { secrets: [localTurnCredentials] },
   async (request) => {
     requireAdmin(request);
     requireAppCheck(request);
