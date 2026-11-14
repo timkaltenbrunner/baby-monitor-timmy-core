@@ -14,6 +14,7 @@ const {
   setDoc,
   collection,
   deleteDoc,
+  deleteField,
   getDocs,
   onSnapshot,
   orderBy,
@@ -91,7 +92,7 @@ test("session documents reject unexpected fields", async () => {
     setDoc(doc(db, "sessions", "session-1"), {
       pairingDocKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       status: "waiting",
-      createdAt: "now",
+      createdAt: serverTimestamp(),
       unexpected: true,
     })
   );
@@ -105,8 +106,8 @@ test("session documents allow the documented signaling fields", async () => {
   await assertSucceeds(
     setDoc(doc(db, "sessions", "session-1"), {
       status: "waiting",
-      createdAt: "now",
-      updatedAt: "later",
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
       pairingDocKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
       version: 1,
     })
@@ -360,23 +361,33 @@ test("only the authorized browser can query its own sessions", async () => {
   const claims = { clientType: "web", webSessionId: "browser-lease" };
   const web = testEnv.authenticatedContext("web", claims).firestore();
   const mobile = testEnv.authenticatedContext("mobile", { clientType: "mobile" }).firestore();
-  const expired = testEnv.authenticatedContext("expired", claims).firestore();
+  const invalidLeases = {
+    expired: { leaseExpiresAt: Timestamp.fromMillis(0) },
+    "past-maximum": { maxExpiresAt: Timestamp.fromMillis(0) },
+    revoked: { status: "revoked" },
+    replaced: { webSessionId: "replacement-lease" },
+  };
+  const invalidBrowsers = Object.keys(invalidLeases).map((uid) =>
+    testEnv.authenticatedContext(uid, claims).firestore()
+  );
   const sessionQuery = (db, pairingDocKey) =>
     query(collection(db, "sessions"), where("pairingDocKey", "==", pairingDocKey));
 
   await testEnv.withSecurityRulesDisabled(async (context) => {
     const db = context.firestore();
     const future = Timestamp.fromMillis(Date.now() + 10 * 60 * 1000);
-    const lease = (uid, expiry) => ({
+    const lease = (uid) => ({
       status: "active",
       webUid: uid,
       webSessionId: "browser-lease",
       pairingDocKey: key,
-      leaseExpiresAt: expiry,
+      leaseExpiresAt: future,
       maxExpiresAt: future,
     });
-    await setDoc(doc(db, "web_client_sessions", "web"), lease("web", future));
-    await setDoc(doc(db, "web_client_sessions", "expired"), lease("expired", Timestamp.fromMillis(0)));
+    await setDoc(doc(db, "web_client_sessions", "web"), lease("web"));
+    for (const [uid, fields] of Object.entries(invalidLeases)) {
+      await setDoc(doc(db, "web_client_sessions", uid), { ...lease(uid), ...fields });
+    }
     await setDoc(doc(db, "sessions", "sample"), { pairingDocKey: key, status: "active" });
     await setDoc(doc(db, "sessions", "other"), { pairingDocKey: otherKey, status: "active" });
     for (const side of ["candidates_baby", "candidates_parent"]) {
@@ -394,14 +405,148 @@ test("only the authorized browser can query its own sessions", async () => {
   assert.deepEqual(snapshot.docs.map((entry) => entry.id), ["sample"]);
   await assertFails(getDocs(collection(web, "sessions")));
   await assertFails(getDocs(sessionQuery(web, otherKey)));
-  await assertFails(getDocs(sessionQuery(expired, key)));
+  for (const browser of invalidBrowsers) {
+    await assertFails(getDocs(sessionQuery(browser, key)));
+    await assertFails(getDoc(doc(browser, "sessions", "sample")));
+  }
   await assertFails(getDocs(collection(mobile, "sessions")));
   await assertFails(getDocs(sessionQuery(mobile, key)));
   await assertSucceeds(getDoc(doc(mobile, "sessions", "sample")));
+  const browserSession = doc(web, "sessions", "browser-as-baby");
+  await assertSucceeds(setDoc(browserSession, {
+    pairingDocKey: key,
+    status: "waiting",
+    offerSdp: null,
+    answerSdp: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  }));
+  await assertSucceeds(updateDoc(browserSession, {
+    offerSdp: "synthetic-offer",
+    updatedAt: serverTimestamp(),
+  }));
+  await assertFails(deleteDoc(browserSession));
   for (const side of ["candidates_baby", "candidates_parent"]) {
     const candidates = (db, session) => collection(db, "sessions", session, side);
     await assertSucceeds(getDocs(query(candidates(web, "sample"), orderBy("ts"))));
     await assertSucceeds(getDocs(candidates(mobile, "sample")));
     await assertFails(getDocs(candidates(web, "other")));
+    for (const browser of invalidBrowsers) {
+      await assertFails(getDocs(query(candidates(browser, "sample"), orderBy("ts"))));
+    }
   }
+});
+
+test("sessions preserve creation time and prevent client parent deletion", async () => {
+  const db = testEnv.authenticatedContext("mobile", { clientType: "mobile" }).firestore();
+  const session = doc(db, "sessions", "sample");
+  const fields = { pairingDocKey: "a".repeat(64), status: "waiting" };
+
+  await assertFails(setDoc(session, fields));
+  await assertFails(setDoc(session, {
+    ...fields,
+    createdAt: Timestamp.fromMillis(0),
+  }));
+  await assertSucceeds(setDoc(session, {
+    ...fields,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    offerSdp: null,
+    answerSdp: null,
+  }));
+  await assertFails(updateDoc(session, { createdAt: deleteField() }));
+  await assertFails(updateDoc(session, { createdAt: serverTimestamp() }));
+  await assertFails(updateDoc(session, { updatedAt: deleteField() }));
+  await assertFails(updateDoc(session, { offerSdp: {} }));
+  await assertFails(updateDoc(session, { answerSdp: 123 }));
+  for (const field of ["iceRestartSeq", "iceRestartRequestSeq", "recreateRequestSeq"]) {
+    await assertFails(updateDoc(session, { [field]: "1" }));
+    await assertSucceeds(updateDoc(session, { [field]: 1 }));
+  }
+  await assertSucceeds(updateDoc(session, {
+    offerSdp: "synthetic-offer",
+    updatedAt: serverTimestamp(),
+  }));
+  await assertSucceeds(updateDoc(session, {
+    offerSdp: null,
+    answerSdp: null,
+    signalingClearedAt: serverTimestamp(),
+  }));
+  await assertFails(deleteDoc(session));
+});
+
+test("candidate timestamps and optional payload fields match the client contract", async () => {
+  const db = testEnv.authenticatedContext("mobile", { clientType: "mobile" }).firestore();
+  const session = doc(db, "sessions", "sample");
+
+  await assertSucceeds(setDoc(session, {
+    pairingDocKey: "a".repeat(64),
+    status: "waiting",
+    createdAt: serverTimestamp(),
+  }));
+  for (const side of ["candidates_baby", "candidates_parent"]) {
+    const candidate = doc(db, "sessions", "sample", side, "one");
+    const fields = { candidate: "synthetic", sdpMid: null, sdpMLineIndex: null };
+
+    await assertFails(setDoc(candidate, { ...fields, ts: Timestamp.fromMillis(0) }));
+    await assertFails(setDoc(candidate, { ...fields, sdpMid: [], ts: serverTimestamp() }));
+    await assertFails(setDoc(candidate, { ...fields, sdpMLineIndex: "0", ts: serverTimestamp() }));
+    await assertSucceeds(setDoc(candidate, { ...fields, ts: serverTimestamp() }));
+    await assertSucceeds(deleteDoc(candidate));
+  }
+});
+
+test("pairing updates support mode selection and enforce types and activity time", async () => {
+  const db = testEnv.authenticatedContext("mobile", { clientType: "mobile" }).firestore();
+  const pairing = doc(db, "pairings", "a".repeat(64));
+
+  await assertFails(setDoc(pairing, { status: "selecting", createdAt: serverTimestamp() }));
+  await assertSucceeds(setDoc(pairing, {
+    status: "selecting",
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  }));
+  await assertFails(updateDoc(pairing, { createdAt: deleteField() }));
+  await assertFails(updateDoc(pairing, { updatedAt: deleteField() }));
+  await assertFails(updateDoc(pairing, {
+    updatedAt: Timestamp.fromMillis(Date.now() + 60_000),
+  }));
+  await assertFails(updateDoc(pairing, { status: [] }));
+  await assertFails(updateDoc(pairing, { activeSessionId: {} }));
+  await assertFails(updateDoc(pairing, { selectedBy: false }));
+  await assertFails(updateDoc(pairing, { selectedMode: 1 }));
+  await assertFails(updateDoc(pairing, { subscriptionMembers: [] }));
+  await assertSucceeds(updateDoc(pairing, {
+    status: deleteField(),
+    selectedMode: "parent",
+    selectedBy: "mobile",
+    subscriptionMembers: { mobile: { selectionUpdatedAt: serverTimestamp() } },
+    updatedAt: serverTimestamp(),
+  }));
+});
+
+test("unrelated updates preserve documents with legacy field values", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await setDoc(doc(db, "sessions", "legacy"), {
+      pairingDocKey: "a".repeat(64),
+      status: "waiting",
+      createdAt: "legacy",
+      offerSdp: 42,
+    });
+    await setDoc(doc(db, "pairings", "a".repeat(64)), {
+      createdAt: "legacy",
+      activeSessionId: 42,
+    });
+  });
+  const db = testEnv.authenticatedContext("mobile", { clientType: "mobile" }).firestore();
+
+  await assertSucceeds(updateDoc(doc(db, "sessions", "legacy"), {
+    status: "ended",
+    updatedAt: serverTimestamp(),
+  }));
+  await assertSucceeds(updateDoc(doc(db, "pairings", "a".repeat(64)), {
+    status: "ended",
+    updatedAt: serverTimestamp(),
+  }));
 });

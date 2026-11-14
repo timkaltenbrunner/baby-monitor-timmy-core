@@ -51,6 +51,16 @@ service cloud.firestore {
       return isMobileClient() || hasActiveWebSession(pairingDocKey);
     }
 
+    function optionalString(data, field) {
+      let value = data.get(field, null);
+      return value == null || value is string;
+    }
+
+    function optionalSequence(data, field) {
+      let value = data.get(field, null);
+      return value == null || (value is int && value >= 0);
+    }
+
     function validSessionKeys() {
       return request.resource.data.keys().hasOnly(
         ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
@@ -66,20 +76,45 @@ service cloud.firestore {
          'iceRestartSeq', 'iceRestartRequestSeq', 'recreateRequestSeq']);
     }
 
+    // Check fields on writes that introduce or change them, so an unrelated
+    // write can still update a document carrying a legacy value.
+    function validSessionValues(data, changed) {
+      return (!changed.hasAny(['offerSdp']) || optionalString(data, 'offerSdp'))
+        && (!changed.hasAny(['answerSdp']) || optionalString(data, 'answerSdp'))
+        && (!changed.hasAny(['iceRestartSeq']) || optionalSequence(data, 'iceRestartSeq'))
+        && (!changed.hasAny(['iceRestartRequestSeq']) || optionalSequence(data, 'iceRestartRequestSeq'))
+        && (!changed.hasAny(['recreateRequestSeq']) || optionalSequence(data, 'recreateRequestSeq'));
+    }
+
+    function validPairingValues(data, changed) {
+      return (!changed.hasAny(['status']) || optionalString(data, 'status'))
+        && (!changed.hasAny(['activeSessionId']) || optionalString(data, 'activeSessionId'))
+        && (!changed.hasAny(['selectedBy']) || optionalString(data, 'selectedBy'))
+        && (!changed.hasAny(['selectedMode']) || optionalString(data, 'selectedMode'))
+        && (!changed.hasAny(['subscriptionMembers'])
+          || data.get('subscriptionMembers', {}) is map);
+    }
+
+    function validUpdatedAt(data, changed) {
+      return !changed.hasAny(['updatedAt']) || data.updatedAt == request.time;
+    }
+
     function validCandidatePayload() {
       return request.resource.data.keys().hasAll(['candidate', 'ts'])
         && request.resource.data.keys().hasOnly(
              ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
         && request.resource.data.candidate is string
-        && request.resource.data.candidate.size() < 8192;
+        && request.resource.data.candidate.size() < 8192
+        && optionalString(request.resource.data, 'sdpMid')
+        && optionalSequence(request.resource.data, 'sdpMLineIndex')
+        && request.resource.data.ts == request.time;
     }
 
     match /admin/{document=**} {
       allow read, write: if isAdmin();
     }
 
-    // Session analytics is server-only. In particular it must not live under
-    // /admin, whose historical rule allows every signed-in client to read.
+    // Session analytics is server-only, including for admin clients.
     match /session_analytics_segments/{document=**} {
       allow read, write: if false;
     }
@@ -122,17 +157,29 @@ service cloud.firestore {
     }
 
     match /sessions/{sessionId} {
-      allow get, delete: if canUsePairing(resource.data.pairingDocKey);
+      // Parent deletion is server-only so cleanup can remove both candidate collections.
+      allow get: if canUsePairing(resource.data.pairingDocKey);
       // The browser parent discovers its session through a filtered listener.
       allow list: if hasActiveWebSession(resource.data.pairingDocKey);
       allow create: if canUsePairing(request.resource.data.pairingDocKey)
-        && request.resource.data.keys().hasAll(['pairingDocKey', 'status'])
+        && validPairingDocKey(request.resource.data.pairingDocKey)
         && validSessionKeys()
-        && request.resource.data.status is string;
+        && request.resource.data.status is string
+        && request.resource.data.createdAt == request.time
+        && validUpdatedAt(request.resource.data, request.resource.data.keys())
+        && validSessionValues(request.resource.data, request.resource.data.keys());
       allow update: if canUsePairing(resource.data.pairingDocKey)
-        && request.resource.data.pairingDocKey == resource.data.pairingDocKey
         && validSessionKeys()
-        && request.resource.data.status is string;
+        && validSessionUpdate();
+
+      function validSessionUpdate() {
+        let data = request.resource.data;
+        let changed = data.diff(resource.data).affectedKeys();
+        return !changed.hasAny(['pairingDocKey', 'createdAt'])
+          && data.status is string
+          && validUpdatedAt(data, changed)
+          && validSessionValues(data, changed);
+      }
     }
 
     match /sessions/{sessionId}/candidates_baby/{id} {
@@ -226,15 +273,29 @@ service cloud.firestore {
     match /pairings/{pairingId} {
       allow get, delete: if canUsePairing(pairingId);
       allow create: if canUsePairing(pairingId)
-         && request.resource.data.keys().hasAll(['status', 'createdAt'])
-         && request.resource.data.keys().hasOnly(
-             ['status', 'createdAt', 'updatedAt', 'activeSessionId',
-              'selectedMode', 'selectedBy', 'subscriptionMembers'])
-         && request.resource.data.status is string;
+        && validPairingDocKey(pairingId)
+        && validPairingKeys()
+        && request.resource.data.status is string
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && validPairingValues(request.resource.data, request.resource.data.keys());
       allow update: if canUsePairing(pairingId)
-         && request.resource.data.keys().hasOnly(
-             ['status', 'createdAt', 'updatedAt', 'activeSessionId',
-              'selectedMode', 'selectedBy', 'subscriptionMembers']);
+        && validPairingKeys()
+        && validPairingUpdate();
+
+      function validPairingKeys() {
+        return request.resource.data.keys().hasOnly(
+          ['status', 'createdAt', 'updatedAt', 'activeSessionId',
+           'selectedMode', 'selectedBy', 'subscriptionMembers']);
+      }
+
+      function validPairingUpdate() {
+        let data = request.resource.data;
+        let changed = data.diff(resource.data).affectedKeys();
+        return !changed.hasAny(['createdAt'])
+          && validUpdatedAt(data, changed)
+          && validPairingValues(data, changed);
+      }
     }
 
     // Gift documents contain server-side purchase data.

@@ -17,8 +17,10 @@ Typical fields:
 - `pubkeys`
 - optional Web Companion metadata: `peerType`, `webUid`, `webSessionId`
 
-The 4-character code is a rendezvous hint, not a security secret. Public-key
-replacement is detected by mandatory SAS verification.
+The 4-character code is a rendezvous hint. Signed-in clients can look up an
+individual meeting. The rules preserve existing public keys and allow a second
+participant to add only their own key. Users verify the intended peer by
+comparing the SAS on both devices.
 
 ### `web_client_sessions/{webUid}`
 
@@ -169,13 +171,26 @@ Returns remotely managed restriction flags and admin banners.
 
 ## Firestore rule contract
 
-- `pairing_codes`: signed-in clients may bootstrap an ECDH meeting point.
-- `sessions`, candidates, and `pairings`: allowed for mobile clients with
-  `clientType == "mobile"` or web clients with an active lease matching the
-  requested `pairingDocKey`.
-- `admin/**`: readable for signed-in clients, writable only for admins.
-- `web_client_sessions`: readable only by the matching browser UID.
-- `web_client_mobiles`: backend-only.
+- `pairing_codes`: signed-in clients use single-document reads. Only
+  participants may cancel or delete a meeting. The sole participant may refresh
+  its server timestamp while waiting for a peer.
+- `sessions` and `pairings`: individual access requires the mobile client
+  claim or a browser lease for the requested pairing routing key. Only an
+  authorized browser can query the sessions for its leased pairing. Mobile
+  client classification is independent of pairing membership.
+- Both ICE candidate subcollections support reads and queries under the parent
+  session's access rule. Clients can delete candidate documents. Scheduled
+  backend cleanup removes expired sessions and their candidates.
+- New sessions and pairings use server creation timestamps. Updates preserve
+  creation timestamps and use the server timestamp when changing activity time.
+  Candidate creation also uses a server timestamp.
+- `admin/**` and `campaign_codes`: admin-only reads and writes.
+- `web_client_sessions`: the matching browser UID may get its own document.
+  `web_client_mobiles` is backend-only.
+- Gift codes, campaign redemptions, premium grants and their token records, and
+  session analytics collections are backend-only.
+- `problem_reports`: admins may get a single document. The admin console
+  lists reports through a callable.
 
 ## Explicit non-goals
 
