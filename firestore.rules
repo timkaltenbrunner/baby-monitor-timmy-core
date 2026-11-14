@@ -51,6 +51,16 @@ service cloud.firestore {
       return isMobileClient() || hasActiveWebSession(pairingDocKey);
     }
 
+    function optionalString(data, field) {
+      let value = data.get(field, null);
+      return value == null || value is string;
+    }
+
+    function optionalSequence(data, field) {
+      let value = data.get(field, null);
+      return value == null || (value is int && value >= 0);
+    }
+
     function validSessionKeys() {
       return request.resource.data.keys().hasOnly(
         ['pairingDocKey', 'status', 'offerSdp', 'answerSdp',
@@ -66,25 +76,45 @@ service cloud.firestore {
          'iceRestartSeq', 'iceRestartRequestSeq', 'recreateRequestSeq']);
     }
 
+    // Check fields on writes that introduce or change them, so an unrelated
+    // write can still update a document carrying a legacy value.
+    function validSessionValues(data, changed) {
+      return (!changed.hasAny(['offerSdp']) || optionalString(data, 'offerSdp'))
+        && (!changed.hasAny(['answerSdp']) || optionalString(data, 'answerSdp'))
+        && (!changed.hasAny(['iceRestartSeq']) || optionalSequence(data, 'iceRestartSeq'))
+        && (!changed.hasAny(['iceRestartRequestSeq']) || optionalSequence(data, 'iceRestartRequestSeq'))
+        && (!changed.hasAny(['recreateRequestSeq']) || optionalSequence(data, 'recreateRequestSeq'));
+    }
+
+    function validPairingValues(data, changed) {
+      return (!changed.hasAny(['status']) || optionalString(data, 'status'))
+        && (!changed.hasAny(['activeSessionId']) || optionalString(data, 'activeSessionId'))
+        && (!changed.hasAny(['selectedBy']) || optionalString(data, 'selectedBy'))
+        && (!changed.hasAny(['selectedMode']) || optionalString(data, 'selectedMode'))
+        && (!changed.hasAny(['subscriptionMembers'])
+          || data.get('subscriptionMembers', {}) is map);
+    }
+
+    function validUpdatedAt(data, changed) {
+      return !changed.hasAny(['updatedAt']) || data.updatedAt == request.time;
+    }
+
     function validCandidatePayload() {
       return request.resource.data.keys().hasAll(['candidate', 'ts'])
         && request.resource.data.keys().hasOnly(
              ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
         && request.resource.data.candidate is string
-        && request.resource.data.candidate.size() < 8192;
-    }
-
-    match /admin/turn_config {
-      allow read, write: if isAdmin();
+        && request.resource.data.candidate.size() < 8192
+        && optionalString(request.resource.data, 'sdpMid')
+        && optionalSequence(request.resource.data, 'sdpMLineIndex')
+        && request.resource.data.ts == request.time;
     }
 
     match /admin/{document=**} {
-      allow read: if signedIn();
-      allow write: if isAdmin();
+      allow read, write: if isAdmin();
     }
 
-    // Session analytics is server-only. In particular it must not live under
-    // /admin, whose historical rule allows every signed-in client to read.
+    // Session analytics is server-only, including for admin clients.
     match /session_analytics_segments/{document=**} {
       allow read, write: if false;
     }
@@ -118,7 +148,7 @@ service cloud.firestore {
     }
 
     match /web_client_sessions/{webUid} {
-      allow read: if signedIn() && request.auth.uid == webUid;
+      allow get: if signedIn() && request.auth.uid == webUid;
       allow write: if false;
     }
 
@@ -127,15 +157,29 @@ service cloud.firestore {
     }
 
     match /sessions/{sessionId} {
-      allow read, delete: if canUsePairing(resource.data.pairingDocKey);
+      // Parent deletion is server-only so cleanup can remove both candidate collections.
+      allow get: if canUsePairing(resource.data.pairingDocKey);
+      // The browser parent discovers its session through a filtered listener.
+      allow list: if hasActiveWebSession(resource.data.pairingDocKey);
       allow create: if canUsePairing(request.resource.data.pairingDocKey)
-        && request.resource.data.keys().hasAll(['pairingDocKey', 'status'])
+        && validPairingDocKey(request.resource.data.pairingDocKey)
         && validSessionKeys()
-        && request.resource.data.status is string;
+        && request.resource.data.status is string
+        && request.resource.data.createdAt == request.time
+        && validUpdatedAt(request.resource.data, request.resource.data.keys())
+        && validSessionValues(request.resource.data, request.resource.data.keys());
       allow update: if canUsePairing(resource.data.pairingDocKey)
-        && request.resource.data.pairingDocKey == resource.data.pairingDocKey
         && validSessionKeys()
-        && request.resource.data.status is string;
+        && validSessionUpdate();
+
+      function validSessionUpdate() {
+        let data = request.resource.data;
+        let changed = data.diff(resource.data).affectedKeys();
+        return !changed.hasAny(['pairingDocKey', 'createdAt'])
+          && data.status is string
+          && validUpdatedAt(data, changed)
+          && validSessionValues(data, changed);
+      }
     }
 
     match /sessions/{sessionId}/candidates_baby/{id} {
@@ -157,39 +201,110 @@ service cloud.firestore {
     }
 
     match /pairing_codes/{code} {
-      allow read, delete: if signedIn();
-      allow create, update: if signedIn()
-        && request.resource.data.keys().hasOnly(
-             ['createdAt', 'pubkeys', 'status',
-              'peerType', 'webUid', 'webSessionId'])
-        && request.resource.data.pubkeys is map
-        && request.resource.data.pubkeys.size() <= 2
-        && request.resource.data.pubkeys[request.auth.uid] is string
-        && request.resource.data.pubkeys[request.auth.uid].size() < 512;
+      // Existing clients look up the meeting before registering their key.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && validMeetingCreation();
+      allow update: if signedIn() && (joinsMeeting() || updatesOwnMeeting());
+      allow delete: if signedIn() && isMeetingParticipant();
+
+      function isMeetingParticipant() {
+        return request.auth.uid in resource.data.pubkeys;
+      }
+
+      function validOwnPublicKey() {
+        let key = request.resource.data.pubkeys[request.auth.uid];
+        return key is string && key.size() > 0 && key.size() < 512;
+      }
+
+      function validMeetingCreation() {
+        let meeting = request.resource.data;
+        return meeting.keys().hasOnly(
+                 ['createdAt', 'pubkeys', 'status',
+                  'peerType', 'webUid', 'webSessionId'])
+          && meeting.createdAt == request.time
+          && meeting.get('status', 'pending') == 'pending'
+          && meeting.pubkeys is map
+          && meeting.pubkeys.keys().hasOnly([request.auth.uid])
+          && validOwnPublicKey()
+          && (
+            !meeting.keys().hasAny(['peerType', 'webUid', 'webSessionId'])
+            || (
+              meeting.peerType == 'web_companion'
+              && meeting.webUid == request.auth.uid
+              && meeting.webSessionId is string
+              && meeting.webSessionId.size() > 0
+              && meeting.webSessionId.size() <= 128
+            )
+          );
+      }
+
+      function joinsMeeting() {
+        let before = resource.data;
+        let after = request.resource.data;
+        return before.get('status', '') != 'cancelled'
+          && before.pubkeys.size() == 1
+          && !isMeetingParticipant()
+          && after.diff(before).affectedKeys().hasOnly(['pubkeys'])
+          && after.pubkeys is map
+          && after.pubkeys.size() == 2
+          && after.pubkeys.diff(before.pubkeys).affectedKeys()
+               .hasOnly([request.auth.uid])
+          && validOwnPublicKey();
+      }
+
+      function updatesOwnMeeting() {
+        let before = resource.data;
+        let after = request.resource.data;
+        let changed = after.diff(before).affectedKeys();
+        return isMeetingParticipant() && (
+          changed.size() == 0
+          || (changed.hasOnly(['status']) && after.status == 'cancelled')
+          || (
+            before.pubkeys.size() == 1
+            && before.get('status', '') != 'cancelled'
+            && changed.hasOnly(['createdAt'])
+            && after.createdAt == request.time
+          )
+        );
+      }
     }
 
     match /pairings/{pairingId} {
-      allow read, delete: if canUsePairing(pairingId);
+      allow get, delete: if canUsePairing(pairingId);
       allow create: if canUsePairing(pairingId)
-         && request.resource.data.keys().hasAll(['status', 'createdAt'])
-         && request.resource.data.keys().hasOnly(
-             ['status', 'createdAt', 'updatedAt', 'activeSessionId',
-              'selectedMode', 'selectedBy', 'subscriptionMembers'])
-         && request.resource.data.status is string;
+        && validPairingDocKey(pairingId)
+        && validPairingKeys()
+        && request.resource.data.status is string
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && validPairingValues(request.resource.data, request.resource.data.keys());
       allow update: if canUsePairing(pairingId)
-         && request.resource.data.keys().hasOnly(
-             ['status', 'createdAt', 'updatedAt', 'activeSessionId',
-              'selectedMode', 'selectedBy', 'subscriptionMembers']);
+        && validPairingKeys()
+        && validPairingUpdate();
+
+      function validPairingKeys() {
+        return request.resource.data.keys().hasOnly(
+          ['status', 'createdAt', 'updatedAt', 'activeSessionId',
+           'selectedMode', 'selectedBy', 'subscriptionMembers']);
+      }
+
+      function validPairingUpdate() {
+        let data = request.resource.data;
+        let changed = data.diff(resource.data).affectedKeys();
+        return !changed.hasAny(['createdAt'])
+          && validUpdatedAt(data, changed)
+          && validPairingValues(data, changed);
+      }
     }
 
+    // Gift documents contain server-side purchase data.
     match /gift_codes/{nonce} {
-      allow read: if signedIn();
-      allow write: if false;
+      allow read, write: if false;
     }
 
     match /campaign_codes/{slug} {
-      allow read: if signedIn();
-      allow write: if isAdmin();
+      allow read, write: if isAdmin();
     }
 
     match /campaign_redemptions/{id} {
@@ -216,7 +331,7 @@ service cloud.firestore {
     // (submitProblemReport / deleteProblemReport) which use the admin SDK.
     // Only the admin can read; clients can never write directly.
     match /problem_reports/{id} {
-      allow read: if isAdmin();
+      allow get: if isAdmin();
       allow write: if false;
     }
   }

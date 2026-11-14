@@ -45,10 +45,14 @@ An attacker who compromises Firestore sees only encrypted SDP/ICE data and canno
 If an attacker has root access to either the Baby or Parent device, they could extract the pairing key from secure storage and decrypt all signaling data. This is outside our threat model – a compromised device can access microphone/camera directly.
 
 #### 3. Short Code Brute-Force
-The 4-character code from alphabet `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (30 chars) provides ~20 bits of entropy (30^4 ≈ 810K possibilities). However, the code is **only a Firebase meeting point** — it is NOT the encryption key. Even if an attacker guesses the code:
-- They see only ECDH public keys (mathematically useless without private keys)
-- Codes expire after 5 minutes (Cloud Function cleanup)
-- The actual encryption key comes from ECDH (256-bit entropy)
+The four-character code uses a 32-character alphabet and identifies a temporary
+Firebase meeting point. The encryption key comes from ECDH. A client that
+knows the code can look up the meeting and try to join it. Users must compare
+the SAS on both devices to verify the peer.
+
+The cleanup job runs every 30 minutes and removes meetings whose server
+timestamp is older than one hour. The mobile creator refreshes the timestamp
+while waiting for the second participant.
 
 #### 4. ECDH Key Exchange over Firebase
 Pairing uses **Elliptic Curve Diffie-Hellman (ECDH)** key exchange with the P-256 (secp256r1) curve over Firebase:
