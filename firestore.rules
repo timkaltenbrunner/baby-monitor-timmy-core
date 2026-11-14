@@ -74,13 +74,8 @@ service cloud.firestore {
         && request.resource.data.candidate.size() < 8192;
     }
 
-    match /admin/turn_config {
-      allow read, write: if isAdmin();
-    }
-
     match /admin/{document=**} {
-      allow read: if signedIn();
-      allow write: if isAdmin();
+      allow read, write: if isAdmin();
     }
 
     // Session analytics is server-only. In particular it must not live under
@@ -118,7 +113,7 @@ service cloud.firestore {
     }
 
     match /web_client_sessions/{webUid} {
-      allow read: if signedIn() && request.auth.uid == webUid;
+      allow get: if signedIn() && request.auth.uid == webUid;
       allow write: if false;
     }
 
@@ -127,7 +122,9 @@ service cloud.firestore {
     }
 
     match /sessions/{sessionId} {
-      allow read, delete: if canUsePairing(resource.data.pairingDocKey);
+      allow get, delete: if canUsePairing(resource.data.pairingDocKey);
+      // The browser parent discovers its session through a filtered listener.
+      allow list: if hasActiveWebSession(resource.data.pairingDocKey);
       allow create: if canUsePairing(request.resource.data.pairingDocKey)
         && request.resource.data.keys().hasAll(['pairingDocKey', 'status'])
         && validSessionKeys()
@@ -157,19 +154,77 @@ service cloud.firestore {
     }
 
     match /pairing_codes/{code} {
-      allow read, delete: if signedIn();
-      allow create, update: if signedIn()
-        && request.resource.data.keys().hasOnly(
-             ['createdAt', 'pubkeys', 'status',
-              'peerType', 'webUid', 'webSessionId'])
-        && request.resource.data.pubkeys is map
-        && request.resource.data.pubkeys.size() <= 2
-        && request.resource.data.pubkeys[request.auth.uid] is string
-        && request.resource.data.pubkeys[request.auth.uid].size() < 512;
+      // Existing clients look up the meeting before registering their key.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && validMeetingCreation();
+      allow update: if signedIn() && (joinsMeeting() || updatesOwnMeeting());
+      allow delete: if signedIn() && isMeetingParticipant();
+
+      function isMeetingParticipant() {
+        return request.auth.uid in resource.data.pubkeys;
+      }
+
+      function validOwnPublicKey() {
+        let key = request.resource.data.pubkeys[request.auth.uid];
+        return key is string && key.size() > 0 && key.size() < 512;
+      }
+
+      function validMeetingCreation() {
+        let meeting = request.resource.data;
+        return meeting.keys().hasOnly(
+                 ['createdAt', 'pubkeys', 'status',
+                  'peerType', 'webUid', 'webSessionId'])
+          && meeting.createdAt == request.time
+          && meeting.get('status', 'pending') == 'pending'
+          && meeting.pubkeys is map
+          && meeting.pubkeys.keys().hasOnly([request.auth.uid])
+          && validOwnPublicKey()
+          && (
+            !meeting.keys().hasAny(['peerType', 'webUid', 'webSessionId'])
+            || (
+              meeting.peerType == 'web_companion'
+              && meeting.webUid == request.auth.uid
+              && meeting.webSessionId is string
+              && meeting.webSessionId.size() > 0
+              && meeting.webSessionId.size() <= 128
+            )
+          );
+      }
+
+      function joinsMeeting() {
+        let before = resource.data;
+        let after = request.resource.data;
+        return before.get('status', '') != 'cancelled'
+          && before.pubkeys.size() == 1
+          && !isMeetingParticipant()
+          && after.diff(before).affectedKeys().hasOnly(['pubkeys'])
+          && after.pubkeys is map
+          && after.pubkeys.size() == 2
+          && after.pubkeys.diff(before.pubkeys).affectedKeys()
+               .hasOnly([request.auth.uid])
+          && validOwnPublicKey();
+      }
+
+      function updatesOwnMeeting() {
+        let before = resource.data;
+        let after = request.resource.data;
+        let changed = after.diff(before).affectedKeys();
+        return isMeetingParticipant() && (
+          changed.size() == 0
+          || (changed.hasOnly(['status']) && after.status == 'cancelled')
+          || (
+            before.pubkeys.size() == 1
+            && before.get('status', '') != 'cancelled'
+            && changed.hasOnly(['createdAt'])
+            && after.createdAt == request.time
+          )
+        );
+      }
     }
 
     match /pairings/{pairingId} {
-      allow read, delete: if canUsePairing(pairingId);
+      allow get, delete: if canUsePairing(pairingId);
       allow create: if canUsePairing(pairingId)
          && request.resource.data.keys().hasAll(['status', 'createdAt'])
          && request.resource.data.keys().hasOnly(
@@ -182,14 +237,13 @@ service cloud.firestore {
               'selectedMode', 'selectedBy', 'subscriptionMembers']);
     }
 
+    // Gift documents contain server-side purchase data.
     match /gift_codes/{nonce} {
-      allow read: if signedIn();
-      allow write: if false;
+      allow read, write: if false;
     }
 
     match /campaign_codes/{slug} {
-      allow read: if signedIn();
-      allow write: if isAdmin();
+      allow read, write: if isAdmin();
     }
 
     match /campaign_redemptions/{id} {
@@ -216,7 +270,7 @@ service cloud.firestore {
     // (submitProblemReport / deleteProblemReport) which use the admin SDK.
     // Only the admin can read; clients can never write directly.
     match /problem_reports/{id} {
-      allow read: if isAdmin();
+      allow get: if isAdmin();
       allow write: if false;
     }
   }
