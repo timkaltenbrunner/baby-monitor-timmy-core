@@ -550,3 +550,87 @@ test("unrelated updates preserve documents with legacy field values", async () =
     updatedAt: serverTimestamp(),
   }));
 });
+
+test("bounded backend cleanup resumes oversized sessions and preserves refreshed meetings", async () => {
+  const { initializeApp, deleteApp } = require("firebase-admin/app");
+  const { getFirestore, Timestamp: AdminTimestamp } = require("firebase-admin/firestore");
+  const { cleanSession, runStaleCleanup } = require("../lib/cleanup_service");
+  const app = initializeApp({ projectId: PROJECT_ID }, "cleanup-test");
+  try {
+    const db = getFirestore(app);
+    const now = new Date();
+    const old = AdminTimestamp.fromMillis(now.getTime() - 48 * 60 * 60 * 1000);
+    const session = db.doc("sessions/old");
+    const baby = session.collection("candidates_baby");
+    const parent = session.collection("candidates_parent");
+    await session.set({ createdAt: old });
+    await baby.doc("a").set({ ts: old });
+    await baby.doc("b").set({ ts: old });
+    await parent.doc("c").set({ ts: old });
+
+    assert.deepEqual(await cleanSession(db, session, now, 2), {
+      candidates: 2, deleted: false, deferred: true,
+    });
+    assert.equal((await session.get()).exists, true);
+    assert.equal((await parent.get()).size, 1);
+    assert.deepEqual(await cleanSession(db, session, now, 2), {
+      candidates: 1, deleted: true, deferred: false,
+    });
+    assert.equal((await session.get()).exists, false);
+    assert.equal((await parent.get()).empty, true);
+
+    const batch = db.batch();
+    for (let index = 0; index < 51; index++) {
+      batch.set(db.doc(`pairing_codes/old-${index}`), { createdAt: old });
+    }
+    batch.set(db.doc("pairing_codes/fresh"), { createdAt: AdminTimestamp.fromDate(now) });
+    await batch.commit();
+    const first = await runStaleCleanup(db, now);
+    assert.equal(first.deleted.pairing_codes, 50);
+    assert.equal(first.more.pairing_codes, true);
+    const second = await runStaleCleanup(db, now);
+    assert.equal(second.deleted.pairing_codes, 1);
+    assert.equal(second.more.pairing_codes, false);
+    assert.equal((await db.doc("pairing_codes/fresh").get()).exists, true);
+  } finally {
+    await deleteApp(app);
+  }
+});
+
+test("historical cleanup skips changed documents and ICE with a session parent", async () => {
+  const { initializeApp, deleteApp } = require("firebase-admin/app");
+  const { getFirestore } = require("firebase-admin/firestore");
+  const { applyOperation } = require("../scripts/firestore_cleanup_inventory");
+  const app = initializeApp({ projectId: PROJECT_ID }, "inventory-test");
+  try {
+    const db = getFirestore(app);
+    const now = new Date(Date.now() + 48 * 60 * 60 * 1000);
+    async function entry(ref, kind) {
+      const time = (await ref.get()).updateTime;
+      const seconds = new Date(time.seconds * 1000).toISOString().slice(0, 19);
+      return { kind, path: ref.path, updateTime: `${seconds}.${String(time.nanoseconds).padStart(9, "0")}Z` };
+    }
+
+    const legacy = db.doc("pairing_codes/legacy");
+    await legacy.set({ marker: 1 });
+    const oldVersion = await entry(legacy, "legacy");
+    await legacy.update({ marker: 2 });
+    assert.equal(await applyOperation(db, oldVersion, now), null);
+    assert.equal((await legacy.get()).exists, true);
+    assert.deepEqual(await applyOperation(db, await entry(legacy, "legacy"), now), { childCount: 0 });
+    assert.equal((await legacy.get()).exists, false);
+
+    const session = db.doc("sessions/restored");
+    const candidate = session.collection("candidates_baby").doc("one");
+    await candidate.set({ candidate: "synthetic" });
+    const orphan = await entry(candidate, "orphan");
+    await session.set({ status: "waiting" });
+    assert.equal(await applyOperation(db, orphan, now), null);
+    assert.equal((await candidate.get()).exists, true);
+    await session.delete();
+    assert.deepEqual(await applyOperation(db, orphan, now), { childCount: 0 });
+    assert.equal((await candidate.get()).exists, false);
+  } finally {
+    await deleteApp(app);
+  }
+});
