@@ -114,6 +114,34 @@ test("session documents allow the documented signaling fields", async () => {
   );
 });
 
+test("signaling writes enforce the telemetry tail and ICE media ID limits", async () => {
+  const db = testEnv.authenticatedContext("mobile", { clientType: "mobile" }).firestore();
+  const session = doc(db, "sessions", "size-limits");
+  await assertSucceeds(setDoc(session, {
+    status: "waiting",
+    createdAt: serverTimestamp(),
+    pairingDocKey: "a".repeat(64),
+    qualityEventsTail: Array.from({ length: 20 }, (_, index) => ({ type: "event", index })),
+  }));
+  await assertFails(updateDoc(session, { qualityEventsTail: Array(21).fill("event") }));
+  await assertFails(updateDoc(session, { qualityEventsTail: {} }));
+  await assertSucceeds(updateDoc(session, { qualityEventsTail: [] }));
+
+  for (const side of ["candidates_baby", "candidates_parent"]) {
+    const candidate = doc(db, "sessions", "size-limits", side, "one");
+    await assertFails(setDoc(candidate, {
+      candidate: "encrypted-candidate",
+      sdpMid: "a".repeat(1025),
+      ts: serverTimestamp(),
+    }));
+    await assertSucceeds(setDoc(candidate, {
+      candidate: "encrypted-candidate",
+      sdpMid: "a".repeat(1024),
+      ts: serverTimestamp(),
+    }));
+  }
+});
+
 test("admin dashboard cannot read raw session documents directly", async () => {
   await testEnv.withSecurityRulesDisabled(async (context) => {
     await setDoc(doc(context.firestore(), "sessions", "session-1"), {

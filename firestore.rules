@@ -83,7 +83,13 @@ service cloud.firestore {
         && (!changed.hasAny(['answerSdp']) || optionalString(data, 'answerSdp'))
         && (!changed.hasAny(['iceRestartSeq']) || optionalSequence(data, 'iceRestartSeq'))
         && (!changed.hasAny(['iceRestartRequestSeq']) || optionalSequence(data, 'iceRestartRequestSeq'))
-        && (!changed.hasAny(['recreateRequestSeq']) || optionalSequence(data, 'recreateRequestSeq'));
+        && (!changed.hasAny(['recreateRequestSeq']) || optionalSequence(data, 'recreateRequestSeq'))
+        && (!changed.hasAny(['qualityEventsTail']) || validQualityEventsTail(data));
+    }
+
+    function validQualityEventsTail(data) {
+      let tail = data.get('qualityEventsTail', []);
+      return tail is list && tail.size() <= 20;
     }
 
     function validPairingValues(data, changed) {
@@ -100,12 +106,13 @@ service cloud.firestore {
     }
 
     function validCandidatePayload() {
+      let mid = request.resource.data.get('sdpMid', null);
       return request.resource.data.keys().hasAll(['candidate', 'ts'])
         && request.resource.data.keys().hasOnly(
              ['candidate', 'sdpMid', 'sdpMLineIndex', 'ts'])
         && request.resource.data.candidate is string
         && request.resource.data.candidate.size() < 8192
-        && optionalString(request.resource.data, 'sdpMid')
+        && (mid == null || (mid is string && mid.size() <= 1024))
         && optionalSequence(request.resource.data, 'sdpMLineIndex')
         && request.resource.data.ts == request.time;
     }

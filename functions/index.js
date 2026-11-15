@@ -1,11 +1,13 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { onDocumentWritten } = require("firebase-functions/v2/firestore");
-const { defineSecret, defineString } = require("firebase-functions/params");
+const { onDocumentWritten, onDocumentCreatedWithAuthContext } = require("firebase-functions/v2/firestore");
+const { logger } = require("firebase-functions");
+const { defineInt, defineSecret, defineString } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const crypto = require("crypto");
+const { sampleCreation } = require("./lib/firestore_usage_sample");
 const {
   DEFAULT_MAX_FUTURE_EXTENSION_DAYS,
   hasReachedRedemptionLimit,
@@ -71,6 +73,7 @@ const localTurnCredentials = defineSecret("LOCAL_TURN_CREDENTIALS");
 // Dedicated, versioned namespace for pseudonymising analytics pairing ids.
 // It is deliberately not shared with gift codes, TURN or signaling secrets.
 const sessionAnalyticsHmacKey = defineSecret("SESSION_ANALYTICS_HMAC_KEY");
+const signalingMetricsSamplePercent = defineInt("SIGNALING_METRICS_SAMPLE_PERCENT", { default: 0 });
 
 const CLOUDFLARE_TURN_BUILTIN_ID = "cloudflare-builtin";
 const LOCAL_TURN_BUILTIN_ID = "local-turn-builtin";
@@ -1383,6 +1386,28 @@ function enqueueSessionAnalyticsCapture({
   }, SESSION_ANALYTICS_DEBOUNCE_MS);
   return entry.promise;
 }
+
+function observeSignalingCreates(document, kind) {
+  return onDocumentCreatedWithAuthContext(
+    { document, secrets: [sessionAnalyticsHmacKey], maxInstances: 2 },
+    (event) => {
+      const percent = signalingMetricsSamplePercent.value();
+      if (percent === 0) return;
+      const secret = normalizeAnalyticsSecret(safeParamValue(sessionAnalyticsHmacKey));
+      const sample = sampleCreation(event, kind, percent, secret);
+      if (sample) logger.info("Firestore signaling usage", sample);
+    }
+  );
+}
+
+exports.observeSessionCreates = observeSignalingCreates("sessions/{sessionId}", "sessions");
+exports.observeMeetingCreates = observeSignalingCreates("pairing_codes/{meetingId}", "pairing_codes");
+exports.observeBabyCandidateCreates = observeSignalingCreates(
+  "sessions/{sessionId}/candidates_baby/{candidateId}", "candidates_baby"
+);
+exports.observeParentCandidateCreates = observeSignalingCreates(
+  "sessions/{sessionId}/candidates_parent/{candidateId}", "candidates_parent"
+);
 
 exports.captureSessionAnalyticsSegment = onDocumentWritten(
   {
