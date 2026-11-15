@@ -38,9 +38,7 @@ function harness() {
           try { return await handler(request); } finally { bound = []; }
         },
       };
-      if (name === 'firebase-functions/v2/firestore') return {
-        onDocumentWritten: () => {}, onDocumentCreatedWithAuthContext: () => {},
-      };
+      if (name === 'firebase-functions/v2/firestore') return { onDocumentWritten: () => {} };
       if (name === 'firebase-functions/v2/scheduler') return { onSchedule: () => {} };
       if (name === 'firebase-admin/app') return { initializeApp() {} };
       if (name === 'firebase-admin/auth') return { getAuth() {} };
