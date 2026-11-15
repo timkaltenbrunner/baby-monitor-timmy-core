@@ -9,11 +9,12 @@ Do **not** open a public GitHub issue for exploitable vulnerabilities.
 
 ## Preferred reporting path
 
-Use GitHub's private vulnerability reporting / security advisory flow for this
-repository if it is enabled.
+Use [Report a vulnerability](https://github.com/timkaltenbrunner/baby-monitor-timmy-core/security/advisories/new)
+to send a private report directly to the maintainers. The report opens a
+private conversation for follow-up.
 
-If that flow is not available, contact the repository owner privately through
-the available GitHub contact channels before publishing details.
+If you cannot use the GitHub form, use the developer support email listed under
+**App support** in [Google Play](https://play.google.com/store/apps/details?id=com.babymonitortimmy.app).
 
 ## What to include
 
