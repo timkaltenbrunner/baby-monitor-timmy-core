@@ -18,7 +18,7 @@ const {
   sanitizeAdminSessionDoc,
   summarizeAdminSessions,
 } = require("./lib/admin_sessions_helpers");
-const { shouldDeleteCleanupDoc, DAY_MS, HOUR_MS } = require("./lib/cleanup_helpers");
+const { runStaleCleanup } = require("./lib/cleanup_service");
 const {
   isOneTimeProductType,
   isPlayProductActive,
@@ -1895,107 +1895,13 @@ exports.cacheTurnUsage = onSchedule(
  * - Campaign_redemptions: retained as a permanent hash/idempotency ledger.
  */
 exports.cleanupStaleSessions = onSchedule(
-  { schedule: "every 30 minutes", timeoutSeconds: 300 },
+  { schedule: "every 30 minutes", timeoutSeconds: 300, maxInstances: 1, concurrency: 1 },
   async () => {
-    const db = getFirestore();
-    const now = new Date();
-
-    let deletedSessions = 0;
-    let deletedPairingCodes = 0;
-    let deletedPairings = 0;
-
-    // Pre-filter with server-side range queries instead of scanning whole
-    // collections every 30 min (which read 1000+ docs/run on busy days and,
-    // alongside snapshotSessionStats, blew the Firestore 50K-reads/day free
-    // tier). Docs missing the relevant timestamp field are simply not matched —
-    // same outcome as before, since shouldDeleteCleanupDoc() already returns
-    // false for missing/invalid timestamps. That guard is kept as a safety net.
-    // All filters are single-field → automatic index, no composite needed.
-    const oneDayAgo = new Date(now.getTime() - DAY_MS);
-    const oneHourAgo = new Date(now.getTime() - HOUR_MS);
-
-    // 1. Delete sessions older than 24 hours (any status).
-    const sessionsSnap = await db
-      .collection("sessions")
-      .where("createdAt", "<", oneDayAgo)
-      .get();
-    for (const doc of sessionsSnap.docs) {
-      if (shouldDeleteCleanupDoc("sessions", doc.data(), now)) {
-        await deleteSubcollection(db, `sessions/${doc.id}/candidates_baby`);
-        await deleteSubcollection(db, `sessions/${doc.id}/candidates_parent`);
-        await doc.ref.delete();
-        deletedSessions++;
-      }
-    }
-
-    // 2. Delete pairing codes older than 1 hour (meeting points are only live
-    // during the brief ECDH handshake; short retention keeps Nearby discovery
-    // from rediscovering stale codes and computing a bogus SAS on a re-pair).
-    const pairingSnap = await db
-      .collection("pairing_codes")
-      .where("createdAt", "<", oneHourAgo)
-      .get();
-    for (const doc of pairingSnap.docs) {
-      if (shouldDeleteCleanupDoc("pairing_codes", doc.data(), now)) {
-        await doc.ref.delete();
-        deletedPairingCodes++;
-      }
-    }
-
-    // 3. Delete stale pairings (ended > 1 hour OR inactive > 24 hours). Two
-    // single-field queries (updatedAt range + status==ended) unioned by doc id;
-    // the updatedAt>1h check stays inside shouldDeleteCleanupDoc so we avoid a
-    // composite (status+updatedAt) index.
-    const pairingCandidates = new Map();
-    const pairingsByAge = await db
-      .collection("pairings")
-      .where("updatedAt", "<", oneDayAgo)
-      .get();
-    pairingsByAge.docs.forEach((doc) => pairingCandidates.set(doc.id, doc));
-    const pairingsEnded = await db
-      .collection("pairings")
-      .where("status", "==", "ended")
-      .get();
-    pairingsEnded.docs.forEach((doc) => pairingCandidates.set(doc.id, doc));
-    for (const doc of pairingCandidates.values()) {
-      if (shouldDeleteCleanupDoc("pairings", doc.data(), now)) {
-        await doc.ref.delete();
-        deletedPairings++;
-      }
-    }
-
-    // 4. Delete expired gift codes (per-doc expiresAt).
-    let deletedGiftCodes = 0;
-    const giftSnap = await db
-      .collection("gift_codes")
-      .where("expiresAt", "<", now)
-      .get();
-    for (const doc of giftSnap.docs) {
-      if (shouldDeleteCleanupDoc("gift_codes", doc.data(), now)) {
-        await doc.ref.delete();
-        deletedGiftCodes++;
-      }
-    }
-
-    console.log(
-      `Cleanup: ${deletedSessions} sessions, ${deletedPairingCodes} pairing codes, ${deletedPairings} pairings, ${deletedGiftCodes} gift codes deleted`
-    );
+    const result = await runStaleCleanup(getFirestore());
+    const log = Object.keys(result.errors).length ? console.error : console.log;
+    log("Firestore stale cleanup", result);
   }
 );
-
-async function deleteSubcollection(db, path) {
-  const snap = await db.collection(path).limit(500).get();
-  if (snap.empty) return;
-
-  const batch = db.batch();
-  snap.docs.forEach((doc) => batch.delete(doc.ref));
-  await batch.commit();
-
-  // Recurse if there were 500 docs (more may remain)
-  if (snap.size === 500) {
-    await deleteSubcollection(db, path);
-  }
-}
 
 // ─── snapshotSessionStats (every 10 minutes) ─────────────────────────────────
 //

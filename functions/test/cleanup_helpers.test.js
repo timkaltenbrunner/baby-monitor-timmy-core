@@ -139,3 +139,48 @@ test("historical pairing without updatedAt falls back to createdAt", () => {
     true
   );
 });
+
+test("inventory finds only old legacy timestamps and scoped orphan candidates", async () => {
+  const { inventory } = require("../scripts/firestore_cleanup_inventory");
+  const now = new Date("2026-04-02T00:00:00Z");
+  const prefix = "projects/baby-monitor-timmy/databases/(default)/documents/";
+  const older = "2026-03-30T00:00:00.123456789Z";
+  const fresh = "2026-04-01T23:00:00Z";
+  const row = (path, updateTime, fields = {}) => ({ name: prefix + path, updateTime, fields });
+  const responses = {
+    sessions: [row("sessions/live", fresh), row("sessions/missing")],
+    pairings: [row("pairings/good", older, {
+      createdAt: { timestampValue: older }, updatedAt: { timestampValue: older },
+    })],
+    pairing_codes: [row("pairing_codes/old", older), row("pairing_codes/recent", fresh)],
+    "sessions/missing/candidates_baby": [
+      row("sessions/missing/candidates_baby/old", older),
+      row("sessions/missing/candidates_baby/recent", fresh),
+    ],
+  };
+  const client = {
+    async request({ url }) {
+      const parsed = new URL(url);
+      const path = parsed.pathname.split("/documents/")[1];
+      if (path === "sessions") assert.equal(parsed.searchParams.get("showMissing"), "true");
+      return { data: { documents: responses[path] || [] } };
+    },
+  };
+  const result = await inventory(client, now);
+  assert.deepEqual(result.operations, [
+    { kind: "orphan", path: "sessions/missing/candidates_baby/old", updateTime: older },
+    { kind: "legacy", path: "pairing_codes/old", updateTime: older },
+  ]);
+});
+
+test("cleanup manifest validation preserves update-time precision and limits target paths", () => {
+  const { isOperation, timestampParts } = require("../scripts/firestore_cleanup_inventory");
+  const updateTime = "2026-04-01T00:00:00.123456789Z";
+  assert.deepEqual(timestampParts(updateTime), {
+    seconds: Date.parse("2026-04-01T00:00:00Z") / 1000,
+    nanoseconds: 123456789,
+  });
+  assert.equal(isOperation({ kind: "legacy", path: "pairing_codes/old", updateTime }), true);
+  assert.equal(isOperation({ kind: "legacy", path: "campaign_redemptions/a", updateTime }), false);
+  assert.equal(isOperation({ kind: "orphan", path: "sessions/a/other/b", updateTime }), false);
+});
