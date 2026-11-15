@@ -25,7 +25,6 @@ function harness() {
     require(name) {
       if (name === 'firebase-functions/params') return {
         defineString: name => ({ value: () => values[name] || '' }),
-        defineInt: (name, options) => ({ value: () => values[name] ?? options.default }),
         defineSecret: name => ({ name, value: () => {
           reads.push({ name, bound: bound.includes(name) });
           if (!bound.includes(name)) throw new Error(`Unbound secret: ${name}`);
