@@ -171,6 +171,10 @@ Returns remotely managed restriction flags and admin banners.
 
 ## Firestore rule contract
 
+Client access requires a matching Firestore rule that grants the requested
+operation. Backend-only collections rely on this default denial. Backend
+access through the Admin SDK is governed by IAM.
+
 - `pairing_codes`: signed-in clients use single-document reads. Only
   participants may cancel or delete a meeting. The sole participant may refresh
   its server timestamp while waiting for a peer.

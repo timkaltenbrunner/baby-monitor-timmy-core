@@ -114,46 +114,8 @@ service cloud.firestore {
       allow read, write: if isAdmin();
     }
 
-    // Session analytics is server-only, including for admin clients.
-    match /session_analytics_segments/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_pairing_days/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_daily/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_overrides/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_override_audit/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_rebuild_jobs/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_dirty_days/{document=**} {
-      allow read, write: if false;
-    }
-
-    match /session_analytics_day_leases/{document=**} {
-      allow read, write: if false;
-    }
-
     match /web_client_sessions/{webUid} {
       allow get: if signedIn() && request.auth.uid == webUid;
-      allow write: if false;
-    }
-
-    match /web_client_mobiles/{mobileUid} {
-      allow read, write: if false;
     }
 
     match /sessions/{sessionId} {
@@ -203,7 +165,6 @@ service cloud.firestore {
     match /pairing_codes/{code} {
       // Existing clients look up the meeting before registering their key.
       allow get: if signedIn();
-      allow list: if false;
       allow create: if signedIn() && validMeetingCreation();
       allow update: if signedIn() && (joinsMeeting() || updatesOwnMeeting());
       allow delete: if signedIn() && isMeetingParticipant();
@@ -298,33 +259,8 @@ service cloud.firestore {
       }
     }
 
-    // Gift documents contain server-side purchase data.
-    match /gift_codes/{nonce} {
-      allow read, write: if false;
-    }
-
     match /campaign_codes/{slug} {
       allow read, write: if isAdmin();
-    }
-
-    match /campaign_redemptions/{id} {
-      allow read: if false;
-      allow write: if false;
-    }
-
-    // Premium grant tokens for the shared premium link. Server-owned: the token
-    // is validated + redeemed inside verifySubscriptionEntitlement (admin SDK),
-    // created by an admin script. Clients never read/write these directly.
-    match /grant_tokens/{token} {
-      allow read, write: if false;
-    }
-
-    match /grant_redemptions/{id} {
-      allow read, write: if false;
-    }
-
-    match /premium_grants/{uid} {
-      allow read, write: if false;
     }
 
     // User problem reports. Server-owned: submitted/deleted via callables
@@ -332,7 +268,6 @@ service cloud.firestore {
     // Only the admin can read; clients can never write directly.
     match /problem_reports/{id} {
       allow get: if isAdmin();
-      allow write: if false;
     }
   }
 }
